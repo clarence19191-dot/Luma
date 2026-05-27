@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Project Luma V0</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="stage">
+        <div class="robot-area">
+          <div class="robot" id="robot">
+            <div class="screen" id="screen">
+              <div class="eye left-eye" id="leftEye"></div>
+              <div class="eye right-eye" id="rightEye"></div>
+              <div class="mouth" id="mouth"></div>
+              <div class="bubble" id="speechBubble"></div>
+            </div>
+            <div class="neck"></div>
+            <div class="base"></div>
+          </div>
+        </div>
+        <aside class="status">
+          <div class="metric"><span>Device</span><strong id="deviceState">offline</strong></div>
+          <div class="metric"><span>Emotion</span><strong id="emotionState">idle</strong></div>
+          <div class="metric"><span>Voice</span><strong id="voiceState">idle</strong></div>
+          <div class="metric"><span>Conversation</span><strong id="conversationState">none</strong></div>
+          <div class="metric"><span>Tone</span><strong id="toneState">-</strong></div>
+          <div class="metric"><span>Pet</span><strong id="behaviorState">-</strong></div>
+          <div class="metric"><span>Boundary</span><strong id="boundaryState">-</strong></div>
+          <div class="metric"><span>Queue</span><strong id="queueState">0</strong></div>
+          <div class="metric"><span>Audio</span><strong id="audioState">0 B</strong></div>
+          <div class="metric"><span>Memory</span><strong id="memoryState">0</strong></div>
+        </aside>
+      </section>
+
+      <section class="workbench">
+        <div class="panel command-panel">
+          <div class="toolbar">
+            <button class="icon-btn" data-command='{"type":"set_emotion","emotion":"happy","duration_ms":3000}' title="Happy">:)</button>
+            <button class="icon-btn" data-command='{"type":"set_emotion","emotion":"thinking","duration_ms":3000}' title="Thinking">?</button>
+            <button class="icon-btn" data-command='{"type":"set_emotion","emotion":"surprised","duration_ms":3000}' title="Surprised">!</button>
+            <button class="icon-btn danger" id="estopBtn" title="Emergency stop">STOP</button>
+            <button class="icon-btn" id="resetBtn" title="Reset stop">RST</button>
+          </div>
+          <div class="emotion-palette" id="emotionPalette"></div>
+          <textarea id="commandInput" spellcheck="false">{"type":"set_emotion","emotion":"happy"}</textarea>
+          <div class="command-row">
+            <input id="speechInput" value="你回来了。" />
+            <button id="voiceTextBtn">Ask</button>
+            <button id="wakeBtn">Wake</button>
+            <button id="simAudioBtn">Sim Audio</button>
+            <button id="sendBtn">Send JSON</button>
+          </div>
+        </div>
+
+        <div class="panel log-panel">
+          <div class="log-head">
+            <span>Events</span>
+            <button id="clearLogBtn">Clear</button>
+          </div>
+          <pre id="eventLog"></pre>
+        </div>
+      </section>
+
+      <section class="vision-strip">
+        <div class="voice-chip" id="transcriptBox">Transcript</div>
+        <div class="vision-text" id="replyText">Reply</div>
+      </section>
+
+      <section class="relationship-strip">
+        <div class="panel relationship-panel">
+          <div class="log-head">
+            <span>Conversation</span>
+            <button id="resetConversationBtn">Reset</button>
+          </div>
+          <div class="relationship-body">
+            <div id="boundaryReason" class="boundary-text">No boundary yet</div>
+            <div id="conversationTurns" class="turn-list"></div>
+          </div>
+        </div>
+        <div class="panel memory-panel">
+          <div class="log-head">
+            <span>Relationship Memory</span>
+            <button id="refreshMemoryBtn">Refresh</button>
+          </div>
+          <div id="memoryList" class="memory-list"></div>
+        </div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

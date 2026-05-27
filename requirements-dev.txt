@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8,<9
+numpy>=1.26
+opencv-python>=4.9
+
