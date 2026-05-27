@@ -62,7 +62,7 @@ Servo files remain in the repository for the later hardware pass.
 
 ## Bring-Up Checklist
 
-- Set `OPENAI_API_KEY` and start Brain on the Mac.
+- Configure local sherpa STT/TTS model paths and the OpenAI-compatible LLM endpoint, then start Brain on the Mac.
 - Configure CoreS3 Wi-Fi and `brain_ws_url`.
 - Confirm `/ws/head` connects and reports `audio.capture_pcm` and `audio.playback_pcm`.
 - Tap the head to trigger the touch fallback wake.

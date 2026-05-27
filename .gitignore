@@ -1,5 +1,6 @@
 .luma/
 StackChan/
+models/
 .env
 .env.*
 .DS_Store

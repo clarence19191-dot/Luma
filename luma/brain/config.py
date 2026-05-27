@@ -23,6 +23,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_path(name: str) -> Path | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return Path(raw).expanduser()
+
+
 _load_env_files()
 
 
@@ -41,6 +48,19 @@ class Settings:
     voice_chunk_ms: int = int(os.getenv("LUMA_VOICE_CHUNK_MS", "40"))
     voice_max_record_seconds: float = float(os.getenv("LUMA_VOICE_MAX_RECORD_SECONDS", "8.0"))
     voice_silence_timeout_seconds: float = float(os.getenv("LUMA_VOICE_SILENCE_TIMEOUT_SECONDS", "1.2"))
+    stt_provider: str = os.getenv("LUMA_STT_PROVIDER", "local_sherpa")
+    tts_provider: str = os.getenv("LUMA_TTS_PROVIDER", "local_sherpa")
+    sherpa_root: Path | None = _env_path("LUMA_SHERPA_ROOT")
+    sherpa_asr_bin: Path | None = _env_path("LUMA_SHERPA_ASR_BIN")
+    sherpa_asr_model_dir: Path | None = _env_path("LUMA_SHERPA_ASR_MODEL_DIR")
+    sherpa_tts_bin: Path | None = _env_path("LUMA_SHERPA_TTS_BIN")
+    sherpa_tts_model_dir: Path | None = _env_path("LUMA_SHERPA_TTS_MODEL_DIR")
+    sherpa_tts_engine: str = os.getenv("LUMA_SHERPA_TTS_ENGINE", "zipvoice")
+    sherpa_tts_vocoder: Path | None = _env_path("LUMA_SHERPA_TTS_VOCODER")
+    tts_reference_audio: Path | None = _env_path("LUMA_TTS_REFERENCE_AUDIO")
+    tts_reference_text: str = os.getenv("LUMA_TTS_REFERENCE_TEXT", "")
+    stt_timeout_seconds: float = float(os.getenv("LUMA_STT_TIMEOUT_SECONDS", "20"))
+    tts_timeout_seconds: float = float(os.getenv("LUMA_TTS_TIMEOUT_SECONDS", "45"))
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_stt_model: str = os.getenv("LUMA_OPENAI_STT_MODEL", "whisper-1")
     openai_tts_model: str = os.getenv("LUMA_OPENAI_TTS_MODEL", "tts-1")

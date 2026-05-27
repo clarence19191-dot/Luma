@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
+import shutil
+import tempfile
 import time
 import wave
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import uuid4
 
 from .config import settings
 from .conversation import ConversationManager
+from .local_audio import AudioConversionError, read_wav_as_pcm16_mono, write_pcm16_wav
 from .llm import LumaLLMDecision, parse_llm_decision
 from .memory import MemoryStore
 from .state import LumaState
@@ -154,6 +159,387 @@ class OpenAITTSProvider(OpenAIProviderBase):
         raise ProviderError("tts_bad_response", "TTS provider did not return PCM bytes.", retryable=True)
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SHERPA_VENDOR_ROOT = Path.home() / "files/Starest/UTM/AcousticPipelineCore/Vendor"
+ZIPVOICE_MODEL_NAME = "sherpa-onnx-zipvoice-distill-int8-zh-en-emilia"
+ZIPVOICE_DEFAULT_REFERENCE_TEXT = "那还是三十六年前, 一九八七年. 我呢考上了武汉大学的计算机系."
+
+
+class LocalSherpaSTTProvider:
+    def __init__(self, config: Any = settings) -> None:
+        self.config = config
+        roots = _sherpa_roots(config)
+        self.executable = _resolve_executable(
+            _setting(config, "sherpa_asr_bin"),
+            "sherpa-onnx",
+            roots,
+            code="stt_provider_unconfigured",
+        )
+        self.model = _resolve_asr_model(_setting(config, "sherpa_asr_model_dir"), roots)
+        self.timeout_seconds = float(_setting(config, "stt_timeout_seconds", 20))
+
+    async def transcribe(self, audio: AudioBuffer) -> str:
+        with tempfile.TemporaryDirectory(prefix="luma-stt-") as temp_dir:
+            wav_path = Path(temp_dir) / "utterance.wav"
+            try:
+                write_pcm16_wav(
+                    wav_path,
+                    audio.pcm,
+                    sample_rate_hz=audio.format.sample_rate_hz,
+                    channels=audio.format.channels,
+                )
+            except AudioConversionError as exc:
+                raise ProviderError("stt_bad_audio", str(exc), retryable=False) from exc
+
+            args = [
+                str(self.executable),
+                f"--tokens={self.model['tokens']}",
+                f"--paraformer-encoder={self.model['encoder']}",
+                f"--paraformer-decoder={self.model['decoder']}",
+                "--num-threads=2",
+                str(wav_path),
+            ]
+            output = await _run_provider_command(
+                args,
+                timeout_seconds=self.timeout_seconds,
+                failed_code="stt_failed",
+                timeout_code="stt_timeout",
+            )
+        return _parse_sherpa_transcript(output)
+
+
+class LocalSherpaTTSProvider:
+    def __init__(self, config: Any = settings) -> None:
+        self.config = config
+        engine = str(_setting(config, "sherpa_tts_engine", "zipvoice")).strip().lower()
+        if engine != "zipvoice":
+            raise ProviderError(
+                "tts_provider_unconfigured",
+                f"Unsupported local sherpa TTS engine: {engine}. Only zipvoice is configured in V0.",
+                retryable=False,
+            )
+        self.engine = engine
+        roots = _sherpa_roots(config)
+        self.executable = _resolve_executable(
+            _setting(config, "sherpa_tts_bin"),
+            "sherpa-onnx-offline-tts",
+            roots,
+            code="tts_provider_unconfigured",
+        )
+        self.model = _resolve_zipvoice_model(config, roots)
+        self.timeout_seconds = float(_setting(config, "tts_timeout_seconds", 45))
+        self.target_sample_rate_hz = int(_setting(config, "voice_sample_rate_hz", settings.voice_sample_rate_hz))
+
+    async def synthesize(self, text: str) -> bytes:
+        cleaned = text.strip()
+        if not cleaned:
+            return b""
+
+        with tempfile.TemporaryDirectory(prefix="luma-tts-") as temp_dir:
+            output_wav = Path(temp_dir) / "reply.wav"
+            args = [
+                str(self.executable),
+                f"--zipvoice-encoder={self.model['encoder']}",
+                f"--zipvoice-decoder={self.model['decoder']}",
+                f"--zipvoice-data-dir={self.model['data_dir']}",
+                f"--zipvoice-lexicon={self.model['lexicon']}",
+                f"--zipvoice-tokens={self.model['tokens']}",
+                f"--zipvoice-vocoder={self.model['vocoder']}",
+                f"--reference-audio={self.model['reference_audio']}",
+                f"--reference-text={self.model['reference_text']}",
+                "--num-steps=4",
+                f"--output-filename={output_wav}",
+                cleaned,
+            ]
+            await _run_provider_command(
+                args,
+                timeout_seconds=self.timeout_seconds,
+                failed_code="tts_failed",
+                timeout_code="tts_timeout",
+            )
+            try:
+                pcm = read_wav_as_pcm16_mono(output_wav, target_sample_rate_hz=self.target_sample_rate_hz)
+            except AudioConversionError as exc:
+                raise ProviderError("tts_bad_audio", str(exc), retryable=True) from exc
+        if not pcm:
+            raise ProviderError("empty_tts", "Local sherpa TTS produced empty audio.", retryable=True)
+        return pcm
+
+
+def make_stt_provider(config: Any = settings) -> STTProvider:
+    provider = str(_setting(config, "stt_provider", "local_sherpa")).strip().lower()
+    if provider in {"local_sherpa", "sherpa", "local"}:
+        return LocalSherpaSTTProvider(config)
+    if provider in {"openai", "openai_compatible"}:
+        return OpenAISTTProvider()
+    raise ProviderError("provider_unconfigured", f"Unsupported STT provider: {provider}.", retryable=False)
+
+
+def make_tts_provider(config: Any = settings) -> TTSProvider:
+    provider = str(_setting(config, "tts_provider", "local_sherpa")).strip().lower()
+    if provider in {"local_sherpa", "sherpa", "local"}:
+        return LocalSherpaTTSProvider(config)
+    if provider in {"openai", "openai_compatible"}:
+        return OpenAITTSProvider()
+    raise ProviderError("provider_unconfigured", f"Unsupported TTS provider: {provider}.", retryable=False)
+
+
+class LazySTTProvider:
+    def __init__(self, factory: Callable[[], STTProvider] = make_stt_provider) -> None:
+        self._factory = factory
+        self._provider: STTProvider | None = None
+
+    async def transcribe(self, audio: AudioBuffer) -> str:
+        if self._provider is None:
+            self._provider = self._factory()
+        return await self._provider.transcribe(audio)
+
+
+class LazyTTSProvider:
+    def __init__(self, factory: Callable[[], TTSProvider] = make_tts_provider) -> None:
+        self._factory = factory
+        self._provider: TTSProvider | None = None
+
+    async def synthesize(self, text: str) -> bytes:
+        if self._provider is None:
+            self._provider = self._factory()
+        return await self._provider.synthesize(text)
+
+
+def _setting(config: Any, name: str, default: Any = None) -> Any:
+    return getattr(config, name, default)
+
+
+def _as_path(value: Any) -> Path | None:
+    if value is None or value == "":
+        return None
+    path = value if isinstance(value, Path) else Path(str(value))
+    path = path.expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _sherpa_roots(config: Any) -> list[Path]:
+    roots = [
+        _as_path(_setting(config, "sherpa_root")),
+        PROJECT_ROOT / "models/sherpa",
+        PROJECT_ROOT / "models",
+        DEFAULT_SHERPA_VENDOR_ROOT,
+    ]
+    return _deduplicate_paths([root for root in roots if root is not None])
+
+
+def _deduplicate_paths(paths: list[Path]) -> list[Path]:
+    output: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key not in seen:
+            output.append(path)
+            seen.add(key)
+    return output
+
+
+def _resolve_executable(explicit: Any, name: str, roots: list[Path], *, code: str) -> Path:
+    explicit_path = _as_path(explicit)
+    if explicit_path is not None:
+        if explicit_path.is_file() and os.access(explicit_path, os.X_OK):
+            return explicit_path
+        raise ProviderError(code, f"{explicit_path} is not an executable file.", retryable=False)
+
+    candidates: list[Path] = []
+    for root in roots:
+        candidates.extend(
+            [
+                root / f"sherpa-onnx-v1.13.0-osx-universal2-shared/bin/{name}",
+                root / "bin" / name,
+                root / name,
+            ]
+        )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+
+    found = shutil.which(name)
+    if found:
+        return Path(found)
+    searched = ", ".join(str(path) for path in candidates[:6])
+    raise ProviderError(code, f"Could not find executable {name}. Searched: {searched}", retryable=False)
+
+
+def _resolve_asr_model(explicit: Any, roots: list[Path]) -> dict[str, Path]:
+    explicit_path = _as_path(explicit)
+    candidates = [explicit_path] if explicit_path is not None else []
+    for root in roots:
+        candidates.extend([root / "sherpa-onnx", root / "asr/sherpa-onnx", root])
+
+    for candidate in _deduplicate_paths([path for path in candidates if path is not None]):
+        model = _asr_model_files(candidate)
+        if model:
+            return model
+        if explicit_path is not None and candidate == explicit_path:
+            break
+
+    raise ProviderError(
+        "stt_provider_unconfigured",
+        "Could not find sherpa ASR model files: tokens.txt, encoder(.int8).onnx, decoder(.int8).onnx.",
+        retryable=False,
+    )
+
+
+def _asr_model_files(directory: Path) -> dict[str, Path] | None:
+    tokens = directory / "tokens.txt"
+    encoder = _first_existing_file(directory / "encoder.int8.onnx", directory / "encoder.onnx")
+    decoder = _first_existing_file(directory / "decoder.int8.onnx", directory / "decoder.onnx")
+    if tokens.is_file() and encoder is not None and decoder is not None:
+        return {"tokens": tokens, "encoder": encoder, "decoder": decoder}
+    return None
+
+
+def _resolve_zipvoice_model(config: Any, roots: list[Path]) -> dict[str, Any]:
+    explicit_path = _as_path(_setting(config, "sherpa_tts_model_dir"))
+    candidates = [explicit_path] if explicit_path is not None else []
+    for root in roots:
+        candidates.extend(
+            [
+                root / ZIPVOICE_MODEL_NAME,
+                root / "tts" / ZIPVOICE_MODEL_NAME,
+                root / "zipvoice",
+                root,
+            ]
+        )
+
+    for candidate in _deduplicate_paths([path for path in candidates if path is not None]):
+        model = _zipvoice_model_files(candidate, config, roots)
+        if model:
+            return model
+        if explicit_path is not None and candidate == explicit_path:
+            break
+
+    raise ProviderError(
+        "tts_provider_unconfigured",
+        "Could not find ZipVoice TTS model files. Configure LUMA_SHERPA_TTS_MODEL_DIR and LUMA_SHERPA_TTS_VOCODER.",
+        retryable=False,
+    )
+
+
+def _zipvoice_model_files(directory: Path, config: Any, roots: list[Path]) -> dict[str, Any] | None:
+    tokens = directory / "tokens.txt"
+    lexicon = directory / "lexicon.txt"
+    data_dir = directory / "espeak-ng-data"
+    encoder = _first_existing_file(directory / "encoder.int8.onnx", directory / "encoder.onnx")
+    decoder = _first_existing_file(directory / "decoder.int8.onnx", directory / "decoder.onnx")
+    vocoder = _resolve_vocoder(_setting(config, "sherpa_tts_vocoder"), directory, roots)
+    reference_audio = _resolve_reference_audio(_setting(config, "tts_reference_audio"), directory)
+    reference_text = str(_setting(config, "tts_reference_text", "") or "").strip()
+    if not reference_text and reference_audio and reference_audio.name == "leijun-1.wav":
+        reference_text = ZIPVOICE_DEFAULT_REFERENCE_TEXT
+    if (
+        tokens.is_file()
+        and lexicon.is_file()
+        and data_dir.is_dir()
+        and encoder is not None
+        and decoder is not None
+        and vocoder is not None
+        and reference_audio is not None
+        and reference_text
+    ):
+        return {
+            "tokens": tokens,
+            "lexicon": lexicon,
+            "data_dir": data_dir,
+            "encoder": encoder,
+            "decoder": decoder,
+            "vocoder": vocoder,
+            "reference_audio": reference_audio,
+            "reference_text": reference_text,
+        }
+    return None
+
+
+def _resolve_vocoder(explicit: Any, model_dir: Path, roots: list[Path]) -> Path | None:
+    explicit_path = _as_path(explicit)
+    candidates = [explicit_path] if explicit_path is not None else []
+    candidates.extend([model_dir / "vocos_24khz.onnx", model_dir.parent / "vocos_24khz.onnx"])
+    candidates.extend(root / "vocos_24khz.onnx" for root in roots)
+    return _first_existing_file(*[path for path in candidates if path is not None])
+
+
+def _resolve_reference_audio(explicit: Any, model_dir: Path) -> Path | None:
+    explicit_path = _as_path(explicit)
+    candidates = [explicit_path] if explicit_path is not None else []
+    candidates.extend([model_dir / "test_wavs/leijun-1.wav", model_dir / "reference.wav"])
+    return _first_existing_file(*[path for path in candidates if path is not None])
+
+
+def _first_existing_file(*paths: Path) -> Path | None:
+    for path in paths:
+        if path.is_file():
+            return path
+    return None
+
+
+async def _run_provider_command(
+    args: list[str],
+    *,
+    timeout_seconds: float,
+    failed_code: str,
+    timeout_code: str,
+) -> str:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise ProviderError(failed_code, str(exc), retryable=True) from exc
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=max(0.1, timeout_seconds))
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise ProviderError(timeout_code, f"Provider command timed out after {timeout_seconds:.1f}s.", retryable=True) from exc
+
+    output = _decode_command_output(stdout) + "\n" + _decode_command_output(stderr)
+    if process.returncode != 0:
+        raise ProviderError(failed_code, _trim_provider_output(output), retryable=True)
+    return output
+
+
+def _decode_command_output(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace")
+
+
+def _trim_provider_output(output: str) -> str:
+    cleaned = output.strip()
+    if not cleaned:
+        return "Provider command failed without output."
+    return cleaned[-2000:]
+
+
+def _parse_sherpa_transcript(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            decoded = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        text = str(decoded.get("text", "") or "").strip()
+        if text:
+            return text
+
+    for line in reversed(lines):
+        if line.startswith("/") or "Recognizer" in line or line.startswith("Started"):
+            continue
+        if line.startswith("--") or line.startswith("Usage:"):
+            continue
+        return line
+    return ""
+
+
 class VoiceSessionRuntime:
     def __init__(
         self,
@@ -173,9 +559,9 @@ class VoiceSessionRuntime:
         self._send_head_json = send_head_json
         self._send_head_bytes = send_head_bytes
         self._broadcast_state = broadcast_state
-        self.stt_provider = stt_provider or OpenAISTTProvider()
+        self.stt_provider = stt_provider or LazySTTProvider()
         self.llm_provider = llm_provider or OpenAILLMProvider()
-        self.tts_provider = tts_provider or OpenAITTSProvider()
+        self.tts_provider = tts_provider or LazyTTSProvider()
         self.conversation = conversation_manager or ConversationManager(memory, self.llm_provider)
         self.format = AudioFormat()
         self._audio = bytearray()
