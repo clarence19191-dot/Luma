@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 import json
+import queue
 import re
 import sqlite3
 import threading
@@ -8,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from .config import settings
 
 
 ALLOWED_MEMORY_CATEGORIES = {
@@ -68,9 +72,17 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._event_lock = threading.Lock()
+        self._event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=max(1, settings.event_log_queue_size))
+        self._event_buffer: deque[dict[str, Any]] = deque(maxlen=max(1000, settings.max_memory_events))
+        self._writer_stop = threading.Event()
+        self._closed = False
+        self._last_event_ts = 0.0
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._migrate()
+        self._writer_thread = threading.Thread(target=self._event_writer_loop, name="luma-event-writer", daemon=True)
+        self._writer_thread.start()
 
     def _migrate(self) -> None:
         with self._lock:
@@ -193,33 +205,46 @@ class MemoryStore:
         self._conn.execute("UPDATE memories SET last_seen_at = updated_at WHERE last_seen_at IS NULL")
 
     def log(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-        event = {"ts": time.time(), "kind": kind, "payload": payload}
-        line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO events(ts, kind, payload) VALUES (?, ?, ?)",
-                (event["ts"], kind, json.dumps(payload, ensure_ascii=False)),
-            )
-            self._conn.commit()
-            with self.jsonl_path.open("a", encoding="utf-8") as fp:
-                fp.write(line + "\n")
+        with self._event_lock:
+            ts = max(time.time(), self._last_event_ts + 0.000001)
+            self._last_event_ts = ts
+            event = {"ts": ts, "kind": kind, "payload": payload}
+            self._event_buffer.append(event)
+            closed = self._closed
+        if not closed:
+            try:
+                self._event_queue.put_nowait(event)
+            except queue.Full:
+                try:
+                    self._event_queue.get_nowait()
+                    self._event_queue.task_done()
+                    self._event_queue.put_nowait(event)
+                except queue.Empty:
+                    pass
         return event
 
     def recent(self, *, limit: int, since_seconds: int | None = None) -> list[dict[str, Any]]:
         lower = 0.0 if since_seconds is None else time.time() - since_seconds
+        with self._event_lock:
+            buffered = [event for event in self._event_buffer if event["ts"] >= lower]
+        seen = {_event_key(event) for event in buffered}
         with self._lock:
             rows = self._conn.execute(
                 "SELECT ts, kind, payload FROM events WHERE ts >= ? ORDER BY id DESC LIMIT ?",
                 (lower, limit),
             ).fetchall()
-        return [
-            {
-                "ts": row[0],
-                "kind": row[1],
-                "payload": json.loads(row[2]),
-            }
-            for row in rows
-        ]
+        events = list(buffered)
+        for row in rows:
+            event = {"ts": row[0], "kind": row[1], "payload": json.loads(row[2])}
+            key = _event_key(event)
+            if key not in seen:
+                events.append(event)
+                seen.add(key)
+        events.sort(key=lambda item: item["ts"], reverse=True)
+        return events[:limit]
+
+    def flush_events(self) -> None:
+        self._event_queue.join()
 
     def current_conversation(self, device_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -650,8 +675,62 @@ class MemoryStore:
         return len(memory_ids)
 
     def close(self) -> None:
+        with self._event_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._writer_stop.set()
+        try:
+            self._event_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._writer_thread.join()
         with self._lock:
             self._conn.close()
+
+    def _event_writer_loop(self) -> None:
+        while not self._writer_stop.is_set() or not self._event_queue.empty():
+            batch: list[dict[str, Any]] = []
+            try:
+                item = self._event_queue.get(timeout=max(0.01, settings.event_log_flush_seconds))
+            except queue.Empty:
+                continue
+            if item is None:
+                self._event_queue.task_done()
+                continue
+            batch.append(item)
+            for _ in range(max(1, settings.event_log_batch_size) - 1):
+                try:
+                    item = self._event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._event_queue.task_done()
+                    continue
+                batch.append(item)
+            try:
+                self._write_event_batch(batch)
+            finally:
+                for _ in batch:
+                    self._event_queue.task_done()
+
+    def _write_event_batch(self, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        rows = [
+            (event["ts"], event["kind"], json.dumps(event["payload"], ensure_ascii=False))
+            for event in events
+        ]
+        lines = [
+            json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+            for event in events
+        ]
+        with self._lock:
+            self._conn.executemany("INSERT INTO events(ts, kind, payload) VALUES (?, ?, ?)", rows)
+            self._conn.commit()
+            with self.jsonl_path.open("a", encoding="utf-8") as fp:
+                for line in lines:
+                    fp.write(line + "\n")
 
     @staticmethod
     def _conversation_from_row(row: tuple[Any, ...]) -> dict[str, Any]:
@@ -737,6 +816,10 @@ def _field(value: dict[str, Any] | Any, name: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _event_key(event: dict[str, Any]) -> str:
+    return json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _memory_category(candidate: dict[str, Any] | Any) -> str:

@@ -43,7 +43,10 @@ private:
     static constexpr int kChunkFrames = kSampleRateHz * kChunkMs / 1000;
     static constexpr int kMaxRecordMs = 8000;
     static constexpr int kSilenceStopMs = 1200;
-    static constexpr int kMaxPlaybackQueueChunks = 5;
+    static constexpr int kNoSpeechStopMs = 2500;
+    static constexpr int kVadPrerollMs = 240;
+    static constexpr int kVadStartChunks = 3;
+    static constexpr int kMaxPlaybackQueueChunks = 25;
     static constexpr uint32_t kTouchWakeCooldownMs = 5000;
     static constexpr uint32_t kTouchTapMinPressMs = 50;
     static constexpr uint32_t kTouchTapMaxPressMs = 700;
@@ -61,6 +64,7 @@ private:
     std::atomic<bool> _playback_notify_done{true};
     std::atomic<bool> _wake_word_active{false};
     std::atomic<bool> _wake_word_paused{false};
+    std::atomic<uint32_t> _playback_overflow_count{0};
     TaskHandle_t _capture_task = nullptr;
     TaskHandle_t _playback_task = nullptr;
     TaskHandle_t _wake_word_task = nullptr;

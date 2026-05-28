@@ -195,8 +195,9 @@ void LumaVoiceRuntime::handlePlaybackChunk(const uint8_t* data, size_t len)
 
     std::lock_guard<std::mutex> lock(_playback_mutex);
     if (_playback_queue.size() >= kMaxPlaybackQueueChunks) {
-        _playback_queue.pop();
-        mclog::tagWarn(TAG, "playback queue full, dropping oldest chunk");
+        const uint32_t overflows = ++_playback_overflow_count;
+        mclog::tagWarn(TAG, "playback queue full, dropping incoming chunk, overflow_count={}", overflows);
+        return;
     }
     _playback_queue.push(std::move(chunk));
 }
@@ -222,6 +223,7 @@ void LumaVoiceRuntime::startPlayback(std::string_view session_id)
     stopCapture();
     _session_id.assign(session_id.data(), session_id.size());
     clearPlaybackQueue();
+    _playback_overflow_count = 0;
     _playback_finishing = false;
     _playback_notify_done = true;
     if (!_playback_active.exchange(true)) {
@@ -390,16 +392,23 @@ void LumaVoiceRuntime::captureLoop()
     audio_codec->EnableInput(true);
 
     const int input_channels = std::max(audio_codec->input_channels(), 1);
-    const int max_chunks     = kMaxRecordMs / kChunkMs;
-    const int silent_limit   = kSilenceStopMs / kChunkMs;
-    int silent_chunks        = 0;
-    int chunks_read          = 0;
-    bool voice_started       = false;
+    const int max_chunks      = kMaxRecordMs / kChunkMs;
+    const int silent_limit    = kSilenceStopMs / kChunkMs;
+    const int no_speech_limit = kNoSpeechStopMs / kChunkMs;
+    const int preroll_limit   = std::max(1, kVadPrerollMs / kChunkMs);
+    int silent_chunks         = 0;
+    int chunks_read           = 0;
+    int chunks_sent           = 0;
+    int start_candidate_chunks = 0;
+    bool voice_started        = false;
+    float noise_floor         = 180.0f;
 
     std::vector<int16_t> input_chunk;
     std::vector<int16_t> mono_chunk;
+    std::vector<std::vector<int16_t>> preroll_chunks;
     input_chunk.resize(kChunkFrames * input_channels);
     mono_chunk.resize(kChunkFrames);
+    preroll_chunks.reserve(preroll_limit);
 
     while (_capture_active.load() && chunks_read < max_chunks) {
         if (!audio_codec->InputData(input_chunk)) {
@@ -409,34 +418,79 @@ void LumaVoiceRuntime::captureLoop()
 
         uint32_t energy = 0;
         for (int i = 0; i < kChunkFrames; ++i) {
-            int16_t sample = input_chunk[i * input_channels];
-            mono_chunk[i]  = sample;
+            int32_t mixed = 0;
+            for (int ch = 0; ch < input_channels; ++ch) {
+                mixed += input_chunk[i * input_channels + ch];
+            }
+            mixed /= input_channels;
+            mixed = std::clamp<int32_t>(mixed, -32768, 32767);
+            int16_t sample = static_cast<int16_t>(mixed);
+            mono_chunk[i] = sample;
             energy += static_cast<uint32_t>(std::abs(sample));
         }
         energy /= kChunkFrames;
 
-        if (_binary_sender) {
-            _binary_sender(reinterpret_cast<const uint8_t*>(mono_chunk.data()), mono_chunk.size() * sizeof(int16_t));
-        }
+        const float start_threshold = std::max(450.0f, noise_floor * 3.0f + 200.0f);
+        const float stop_threshold  = std::max(320.0f, noise_floor * 1.8f + 120.0f);
+        chunks_read += 1;
 
-        if (energy > 450) {
-            voice_started = true;
-            silent_chunks = 0;
-        } else if (voice_started) {
-            silent_chunks += 1;
-            if (silent_chunks >= silent_limit) {
+        if (!voice_started) {
+            if (energy < static_cast<uint32_t>(start_threshold)) {
+                noise_floor = noise_floor * 0.95f + static_cast<float>(energy) * 0.05f;
+            }
+            preroll_chunks.push_back(mono_chunk);
+            if (static_cast<int>(preroll_chunks.size()) > preroll_limit) {
+                preroll_chunks.erase(preroll_chunks.begin());
+            }
+
+            if (energy >= static_cast<uint32_t>(start_threshold)) {
+                start_candidate_chunks += 1;
+            } else {
+                start_candidate_chunks = 0;
+            }
+
+            if (start_candidate_chunks >= kVadStartChunks) {
+                voice_started = true;
+                silent_chunks = 0;
+                mclog::tagInfo(TAG, "voice detected after {} chunks, energy={}, noise_floor={}", chunks_read, energy, noise_floor);
+                for (const auto& chunk : preroll_chunks) {
+                    if (_binary_sender) {
+                        _binary_sender(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * sizeof(int16_t));
+                        chunks_sent += 1;
+                    }
+                }
+                preroll_chunks.clear();
+            } else if (chunks_read >= no_speech_limit) {
+                mclog::tagInfo(TAG, "no speech detected, chunks={}, noise_floor={}", chunks_read, noise_floor);
                 break;
             }
-        }
+        } else {
+            if (_binary_sender) {
+                _binary_sender(reinterpret_cast<const uint8_t*>(mono_chunk.data()), mono_chunk.size() * sizeof(int16_t));
+                chunks_sent += 1;
+            }
 
-        chunks_read += 1;
+            if (energy <= static_cast<uint32_t>(stop_threshold)) {
+                silent_chunks += 1;
+                if (silent_chunks >= silent_limit) {
+                    break;
+                }
+            } else {
+                silent_chunks = 0;
+            }
+        }
     }
 
     audio_codec->EnableInput(false);
     _capture_active = false;
     setEmotion("thinking");
     setStatus("Thinking");
-    sendJsonf("{\"type\":\"audio_end\",\"session_id\":\"%s\",\"chunks\":%d}", _session_id.c_str(), chunks_read);
+    sendJsonf(
+        "{\"type\":\"audio_end\",\"session_id\":\"%s\",\"chunks\":%d,\"captured_chunks\":%d,\"vad_started\":%s}",
+        _session_id.c_str(),
+        chunks_sent,
+        chunks_read,
+        voice_started ? "true" : "false");
     _capture_task = nullptr;
     vTaskDelete(nullptr);
 }

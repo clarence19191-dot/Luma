@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from .config import settings
 from .conversation import ConversationManager
-from .local_audio import AudioConversionError, read_wav_as_pcm16_mono, write_pcm16_wav
+from .local_audio import AudioConversionError, read_wav_as_pcm16_mono, trim_pcm16_silence, write_pcm16_wav
 from .llm import LumaLLMDecision, MemoryReflectionDecision, parse_llm_decision, parse_memory_reflection
 from .memory import MemoryStore
 from .state import LumaState
@@ -24,6 +24,7 @@ from .state import LumaState
 JsonSender = Callable[[dict[str, Any]], Awaitable[bool]]
 BytesSender = Callable[[bytes], Awaitable[bool]]
 StateBroadcaster = Callable[[str], Awaitable[None]]
+SleepFunc = Callable[[float], Awaitable[None]]
 
 
 class ProviderError(RuntimeError):
@@ -562,6 +563,7 @@ class VoiceSessionRuntime:
         llm_provider: LLMProvider | None = None,
         tts_provider: TTSProvider | None = None,
         conversation_manager: ConversationManager | None = None,
+        sleep: SleepFunc | None = None,
     ) -> None:
         self.state = state
         self.memory = memory
@@ -572,10 +574,12 @@ class VoiceSessionRuntime:
         self.llm_provider = llm_provider or OpenAILLMProvider()
         self.tts_provider = tts_provider or LazyTTSProvider()
         self.conversation = conversation_manager or ConversationManager(memory, self.llm_provider)
+        self._sleep = sleep or asyncio.sleep
         self.format = AudioFormat()
         self._audio = bytearray()
         self._session_id: str | None = None
         self._processing_task: asyncio.Task[Any] | None = None
+        self._error_recovery_task: asyncio.Task[Any] | None = None
         self._max_audio_bytes = int(settings.voice_max_record_seconds * self.format.bytes_per_second)
         self._play_chunk_bytes = max(960, int(self.format.bytes_per_second * settings.voice_chunk_ms / 1000))
 
@@ -627,7 +631,6 @@ class VoiceSessionRuntime:
             return
         if len(self._audio) + len(data) > self._max_audio_bytes:
             await self.fail("audio_too_long", "Recording exceeded the configured V0 limit.", retryable=False)
-            await self._send_head_json({"type": "cancel_session", "session_id": self._session_id, "reason": "audio_too_long"})
             return
         self._audio.extend(data)
         self.state.update_voice("listening", session_id=self._session_id, audio_bytes=len(self._audio))
@@ -666,6 +669,14 @@ class VoiceSessionRuntime:
         await self._broadcast_state("voice_playback_done")
 
     async def cancel(self, *, reason: str = "cancelled", notify_head: bool = True) -> None:
+        if (
+            self._error_recovery_task
+            and not self._error_recovery_task.done()
+            and self._error_recovery_task is not asyncio.current_task()
+        ):
+            self._error_recovery_task.cancel()
+            await asyncio.gather(self._error_recovery_task, return_exceptions=True)
+        self._error_recovery_task = None
         if self._processing_task and not self._processing_task.done():
             self._processing_task.cancel()
             await asyncio.gather(self._processing_task, return_exceptions=True)
@@ -686,11 +697,73 @@ class VoiceSessionRuntime:
         self.state.update_voice("error", session_id=session_id, error=error)
         self.memory.log("voice_error", {"session_id": session_id, "error": error})
         await self._broadcast_state("voice_error")
+        if session_id:
+            await self._send_recovery_json({"type": "cancel_session", "session_id": session_id, "reason": code})
+        await self._send_recovery_json({"type": "set_emotion", "emotion": "idle"})
+        if self._error_recovery_task and not self._error_recovery_task.done():
+            self._error_recovery_task.cancel()
+            await asyncio.gather(self._error_recovery_task, return_exceptions=True)
+        self._error_recovery_task = asyncio.create_task(
+            self._recover_from_error(session_id), name=f"luma-error-recovery-{session_id or 'none'}"
+        )
+
+    async def _recover_from_error(self, session_id: str | None) -> None:
+        delay = max(0.0, settings.voice_error_recovery_seconds)
+        try:
+            if delay:
+                await self._sleep(delay)
+            if self._session_id == session_id and self.state.voice.phase == "error":
+                self._audio.clear()
+                self._session_id = None
+                self.state.update_voice("idle", session_id=session_id)
+                await self._broadcast_state("voice_error_recovered")
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._error_recovery_task is asyncio.current_task():
+                self._error_recovery_task = None
+
+    async def _send_recovery_json(self, message: dict[str, Any]) -> None:
+        try:
+            await self._send_head_json(message)
+        except Exception as exc:  # pragma: no cover - recovery is best effort
+            self.memory.log("voice_recovery_send_error", {"message": message, "error": str(exc)})
 
     async def _process_audio(self, session_id: str, pcm: bytes) -> None:
-        audio = AudioBuffer(pcm=pcm, format=self.format)
         try:
+            original_bytes = len(pcm)
+            min_trim_bytes = int(0.25 * self.format.bytes_per_second)
+            if settings.server_vad_trim_enabled and len(pcm) >= min_trim_bytes:
+                try:
+                    pcm = trim_pcm16_silence(
+                        pcm,
+                        sample_rate_hz=self.format.sample_rate_hz,
+                        channels=self.format.channels,
+                    )
+                except AudioConversionError as exc:
+                    self.memory.log("voice_vad_trim_error", {"session_id": session_id, "error": str(exc)})
+                else:
+                    if len(pcm) != original_bytes:
+                        self.memory.log(
+                            "voice_vad_trimmed",
+                            {"session_id": session_id, "input_bytes": original_bytes, "output_bytes": len(pcm)},
+                        )
+            if not pcm:
+                self.memory.log("voice_no_speech", {"session_id": session_id, "bytes": original_bytes})
+                self.state.update_voice("idle", session_id=session_id, transcript="")
+                self._session_id = None
+                await self._send_head_json({"type": "cancel_session", "session_id": session_id, "reason": "no_speech"})
+                await self._send_head_json({"type": "set_emotion", "emotion": "idle"})
+                await self._broadcast_state("voice_no_speech")
+                return
+
+            audio = AudioBuffer(pcm=pcm, format=self.format)
+            stt_started = time.time()
             transcript = await self.stt_provider.transcribe(audio)
+            self.memory.log(
+                "voice_stt_done",
+                {"session_id": session_id, "latency_seconds": time.time() - stt_started, "input_bytes": len(pcm)},
+            )
             if not transcript:
                 self.memory.log("voice_no_speech", {"session_id": session_id, "bytes": len(pcm)})
                 self.state.update_voice("idle", session_id=session_id, transcript="")
@@ -713,10 +786,15 @@ class VoiceSessionRuntime:
     async def _process_text(self, session_id: str, text: str) -> None:
         started = time.time()
         try:
+            llm_started = time.time()
             result = await self.conversation.process_user_turn(
                 text,
                 device_id=self.state.device.device_id or "local",
                 source="voice",
+            )
+            self.memory.log(
+                "voice_llm_done",
+                {"session_id": session_id, "latency_seconds": time.time() - llm_started},
             )
             decision = result.decision
             reply = decision.reply.text
@@ -752,6 +830,7 @@ class VoiceSessionRuntime:
             )
             await self._broadcast_state("voice_reply")
 
+            tts_started = time.time()
             pcm = await self.tts_provider.synthesize(reply)
             if not pcm:
                 raise ProviderError("empty_tts", "TTS provider returned empty audio.", retryable=True)
@@ -767,9 +846,17 @@ class VoiceSessionRuntime:
                 boundary=result.boundary.to_dict(),
                 memory_count=len(result.saved_memories),
             )
-            self.memory.log("voice_tts_audio", {"session_id": session_id, "bytes": len(pcm)})
+            self.memory.log(
+                "voice_tts_audio",
+                {"session_id": session_id, "bytes": len(pcm), "latency_seconds": time.time() - tts_started},
+            )
             await self._broadcast_state("voice_speaking")
+            playback_started = time.time()
             await self._stream_audio_to_head(session_id, pcm)
+            self.memory.log(
+                "voice_playback_streamed",
+                {"session_id": session_id, "bytes": len(pcm), "latency_seconds": time.time() - playback_started},
+            )
         except ProviderError as exc:
             await self.fail(exc.code, exc.message, retryable=exc.retryable)
         except Exception as exc:  # pragma: no cover - defensive runtime guard
@@ -786,9 +873,12 @@ class VoiceSessionRuntime:
                 "bytes": len(pcm),
             }
         )
-        for offset in range(0, len(pcm), self._play_chunk_bytes):
-            ok = await self._send_head_bytes(pcm[offset : offset + self._play_chunk_bytes])
+        initial_buffer_chunks = max(0, settings.playback_initial_buffer_chunks)
+        for chunk_index, offset in enumerate(range(0, len(pcm), self._play_chunk_bytes)):
+            chunk = pcm[offset : offset + self._play_chunk_bytes]
+            if chunk_index >= initial_buffer_chunks:
+                await self._sleep(len(chunk) / self.format.bytes_per_second)
+            ok = await self._send_head_bytes(chunk)
             if not ok:
                 raise ProviderError("head_offline", "CoreS3 is not connected for audio playback.", retryable=True)
-            await asyncio.sleep(0)
         await self._send_head_json({"type": "play_audio_end", "session_id": session_id})

@@ -56,6 +56,8 @@ class DeviceState:
     role: str | None = None
     capabilities: list[str] = field(default_factory=list)
     last_seen: float | None = None
+    telemetry: dict[str, Any] = field(default_factory=dict)
+    telemetry_updated_at: float | None = None
     queue_length: int = 0
     estopped: bool = False
 
@@ -123,10 +125,18 @@ class LumaState:
         self.device.role = role
         self.device.capabilities = capabilities
         self.device.last_seen = time.time()
+        self.device.telemetry = {}
+        self.device.telemetry_updated_at = None
         self.device.estopped = False
 
     def mark_seen(self) -> None:
         self.device.last_seen = time.time()
+
+    def update_telemetry(self, telemetry: dict[str, Any]) -> None:
+        now = time.time()
+        self.device.last_seen = now
+        self.device.telemetry = telemetry
+        self.device.telemetry_updated_at = now
 
     def mark_disconnected(self) -> None:
         self.device.connected = False
@@ -264,6 +274,8 @@ class LumaState:
                 "role": self.device.role,
                 "capabilities": self.device.capabilities,
                 "last_seen": self.device.last_seen,
+                "telemetry": self.device.telemetry,
+                "telemetry_updated_at": self.device.telemetry_updated_at,
                 "queue_length": self.device.queue_length,
                 "estopped": self.device.estopped,
             },

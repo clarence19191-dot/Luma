@@ -53,6 +53,66 @@ def read_wav_as_pcm16_mono(path: Path, *, target_sample_rate_hz: int) -> bytes:
     return _encode_pcm16(samples)
 
 
+def trim_pcm16_silence(
+    pcm: bytes,
+    *,
+    sample_rate_hz: int,
+    channels: int,
+    window_ms: int = 20,
+    margin_ms: int = 160,
+    min_threshold: int = 220,
+) -> bytes:
+    if sample_rate_hz <= 0:
+        raise AudioConversionError("sample_rate_hz must be positive.")
+    if channels <= 0:
+        raise AudioConversionError("channels must be positive.")
+    frame_size = channels * 2
+    if len(pcm) % frame_size:
+        raise AudioConversionError("PCM payload is not aligned to 16-bit channel frames.")
+    if not pcm:
+        return b""
+
+    total_frames = len(pcm) // frame_size
+    window_frames = max(1, sample_rate_hz * max(1, window_ms) // 1000)
+    magnitudes: list[tuple[int, int, float]] = []
+    for start in range(0, total_frames, window_frames):
+        end = min(total_frames, start + window_frames)
+        magnitudes.append((start, end, _pcm_window_magnitude(pcm, start, end, channels=channels)))
+
+    peak = max((magnitude for _, _, magnitude in magnitudes), default=0.0)
+    if peak < min_threshold:
+        return b""
+    sorted_magnitudes = sorted(magnitude for _, _, magnitude in magnitudes)
+    floor_index = min(len(sorted_magnitudes) - 1, max(0, len(sorted_magnitudes) // 5))
+    noise_floor = sorted_magnitudes[floor_index] if sorted_magnitudes else 0.0
+    adaptive_threshold = min(peak * 0.35, noise_floor * 2.5 + 80.0)
+    threshold = max(float(min_threshold), adaptive_threshold)
+
+    active = [(start, end) for start, end, magnitude in magnitudes if magnitude >= threshold]
+    if not active:
+        return b""
+
+    margin_frames = sample_rate_hz * max(0, margin_ms) // 1000
+    start_frame = max(0, active[0][0] - margin_frames)
+    end_frame = min(total_frames, active[-1][1] + margin_frames)
+    return pcm[start_frame * frame_size : end_frame * frame_size]
+
+
+def _pcm_window_magnitude(pcm: bytes, start_frame: int, end_frame: int, *, channels: int) -> float:
+    if end_frame <= start_frame:
+        return 0.0
+    frame_size = channels * 2
+    total = 0
+    count = 0
+    for frame in range(start_frame, end_frame):
+        offset = frame * frame_size
+        for channel in range(channels):
+            raw = pcm[offset + channel * 2 : offset + channel * 2 + 2]
+            total += abs(int.from_bytes(raw, "little", signed=True))
+            count += 1
+    return total / max(1, count)
+
+
 def _decode_pcm_frames(data: bytes, *, channels: int, sample_width: int) -> list[int]:
     frame_width = channels * sample_width
     if len(data) % frame_width:

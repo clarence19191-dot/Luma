@@ -12,38 +12,17 @@ Project Luma is a CoreS3-based desktop pet prototype. The system is split into:
 
 ```bash
 python3 -m pip install -r requirements.txt
+cp example.env.local .env.local
 python3 -m luma.brain
 ```
 
 Open `http://127.0.0.1:8787` to use the web console and browser simulator.
 
-Brain loads `.env.local` and `.env` from the working directory. `.env.local` is ignored by git.
-
-Example `.env.local`:
-
-```text
-LUMA_STT_PROVIDER=local_sherpa
-LUMA_TTS_PROVIDER=local_sherpa
-LUMA_SHERPA_ROOT=./models/sherpa
-
-LUMA_SHERPA_TTS_MODEL_DIR=./models/sherpa/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia
-LUMA_SHERPA_TTS_VOCODER=./models/sherpa/vocos_24khz.onnx
-LUMA_TTS_REFERENCE_AUDIO=./models/sherpa/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia/test_wavs/leijun-1.wav
-LUMA_TTS_REFERENCE_TEXT=reference voice text
-
-LUMA_LLM_BASE_URL=https://api.openai.com/v1
-LUMA_LLM_MODEL=gpt-4o-mini
-LUMA_LLM_API_KEY=...
-LUMA_LLM_JSON_MODE=1
-
-LUMA_VOICE_SAMPLE_RATE_HZ=24000
-LUMA_VOICE_CHUNK_MS=40
-LUMA_VOICE_MAX_RECORD_SECONDS=8
-```
+Brain loads `.env.local` and `.env` from the working directory. `.env.local` is ignored by git; `example.env.local` is a safe tracked template with placeholder values.
 
 ## Local Speech
 
-Local STT uses `sherpa-onnx`; local TTS uses `sherpa-onnx-offline-tts`. The runtime does not download model files automatically and does not silently fall back to cloud speech providers.
+Local STT uses `sherpa-onnx`; local TTS uses `sherpa-onnx-offline-tts`. These are offline full-utterance providers, not streaming providers. The runtime does not download model files automatically and does not silently fall back to cloud speech providers.
 
 Expected ASR/runtime layout:
 
@@ -71,7 +50,7 @@ models/sherpa/
   vocos_24khz.onnx
 ```
 
-Generated TTS audio is converted to the CoreS3 playback format: 24 kHz, mono, PCM16.
+Generated TTS audio is converted to the CoreS3 playback format: 24 kHz, mono, PCM16. Brain sends playback PCM at the audio realtime rate after a small initial buffer so the CoreS3 playback queue does not underrun or overflow during normal playback.
 
 ## Brain Behavior
 

@@ -12,38 +12,17 @@ Project Luma 是一个基于 CoreS3 的桌面 AI 宠物原型。系统分为：
 
 ```bash
 python3 -m pip install -r requirements.txt
+cp example.env.local .env.local
 python3 -m luma.brain
 ```
 
 网页控制台和浏览器模拟器地址：`http://127.0.0.1:8787`。
 
-Brain 会从工作目录加载 `.env.local` 和 `.env`。`.env.local` 已被 git 忽略。
-
-`.env.local` 示例：
-
-```text
-LUMA_STT_PROVIDER=local_sherpa
-LUMA_TTS_PROVIDER=local_sherpa
-LUMA_SHERPA_ROOT=./models/sherpa
-
-LUMA_SHERPA_TTS_MODEL_DIR=./models/sherpa/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia
-LUMA_SHERPA_TTS_VOCODER=./models/sherpa/vocos_24khz.onnx
-LUMA_TTS_REFERENCE_AUDIO=./models/sherpa/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia/test_wavs/leijun-1.wav
-LUMA_TTS_REFERENCE_TEXT=参考音频对应文本
-
-LUMA_LLM_BASE_URL=https://api.openai.com/v1
-LUMA_LLM_MODEL=gpt-4o-mini
-LUMA_LLM_API_KEY=...
-LUMA_LLM_JSON_MODE=1
-
-LUMA_VOICE_SAMPLE_RATE_HZ=24000
-LUMA_VOICE_CHUNK_MS=40
-LUMA_VOICE_MAX_RECORD_SECONDS=8
-```
+Brain 会从工作目录加载 `.env.local` 和 `.env`。`.env.local` 已被 git 忽略；`example.env.local` 是可提交到仓库的占位模板。
 
 ## 本地语音
 
-本地 STT 使用 `sherpa-onnx`，本地 TTS 使用 `sherpa-onnx-offline-tts`。运行时不会自动下载模型，也不会静默回退到云端语音 provider。
+本地 STT 使用 `sherpa-onnx`，本地 TTS 使用 `sherpa-onnx-offline-tts`。它们是离线整句 provider，不是真流式 provider。运行时不会自动下载模型，也不会静默回退到云端语音 provider。
 
 ASR/runtime 目录示例：
 
@@ -71,7 +50,7 @@ models/sherpa/
   vocos_24khz.onnx
 ```
 
-TTS 生成音频会被转换为 CoreS3 播放格式：24 kHz、单声道、PCM16。
+TTS 生成音频会被转换为 CoreS3 播放格式：24 kHz、单声道、PCM16。Brain 会在少量初始缓冲后按音频实时速率推送播放 PCM，避免正常播放时压爆或饿住 CoreS3 播放队列。
 
 ## Brain 行为
 

@@ -183,6 +183,7 @@ class LumaRuntime:
         self._last_idle_emotion = "idle"
         self._ignored_voice_sessions: set[str] = set()
         self._last_touch_wake_at = 0.0
+        self._last_telemetry_broadcast_at = 0.0
 
     async def start(self) -> None:
         self._tasks = [
@@ -630,7 +631,12 @@ async def _handle_head_message(raw: str) -> None:
             runtime.head.resolve_pending(command_id, message)
         runtime.memory.log(f"head_{message_type}", message)
     elif message_type == "telemetry":
-        runtime.memory.log("head_telemetry", message)
+        telemetry = {key: value for key, value in message.items() if key != "type"}
+        runtime.state.update_telemetry(telemetry)
+        now = time.time()
+        if now - runtime._last_telemetry_broadcast_at >= settings.telemetry_broadcast_seconds:
+            runtime._last_telemetry_broadcast_at = now
+            await runtime.broadcast_state("head_telemetry")
     elif message_type == "wake_detected":
         accepted, reason = runtime.should_accept_wake(message)
         if not accepted:

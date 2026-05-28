@@ -12,6 +12,7 @@ firmware/core_s3/main/apps/app_luma/secrets.h
 __pycache__/
 *.py[cod]
 .pytest_cache/
+tests/
 .venv/
 dist/
 build/

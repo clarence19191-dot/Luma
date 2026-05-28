@@ -1,7 +1,7 @@
 /*
  * Project Luma local firmware configuration.
  *
- * Copy secrets.example.h to secrets.h in this directory for a private build.
+ * Copy include/secrets.example.h to include/secrets.h for a private build.
  */
 #pragma once
 
