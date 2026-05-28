@@ -1,6 +1,8 @@
 .luma/
-StackChan/
+/StackChan/
 models/
+firmware/core_s3/include/secrets.h
+firmware/core_s3/main/apps/app_luma/secrets.h
 .env
 .env.*
 .DS_Store

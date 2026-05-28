@@ -532,6 +532,8 @@ def _parse_sherpa_transcript(output: str) -> str:
             return text
 
     for line in reversed(lines):
+        if line.startswith("{") and line.endswith("}"):
+            continue
         if line.startswith("/") or "Recognizer" in line or line.startswith("Started"):
             continue
         if line.startswith("--") or line.startswith("Usage:"):
@@ -683,7 +685,13 @@ class VoiceSessionRuntime:
         try:
             transcript = await self.stt_provider.transcribe(audio)
             if not transcript:
-                transcript = "我没有听清楚。"
+                self.memory.log("voice_no_speech", {"session_id": session_id, "bytes": len(pcm)})
+                self.state.update_voice("idle", session_id=session_id, transcript="")
+                self._session_id = None
+                await self._send_head_json({"type": "cancel_session", "session_id": session_id, "reason": "no_speech"})
+                await self._send_head_json({"type": "set_emotion", "emotion": "idle"})
+                await self._broadcast_state("voice_no_speech")
+                return
             self.state.update_voice("thinking", session_id=session_id, transcript=transcript)
             self.memory.log("voice_transcript", {"session_id": session_id, "text": transcript})
             await self._broadcast_state("voice_transcript")

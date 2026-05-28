@@ -23,6 +23,7 @@ public:
     using BinaryHandler  = std::function<void(const uint8_t*, size_t)>;
 
     LumaWsClient(CommandHandler command_handler, ControlHandler control_handler, BinaryHandler binary_handler);
+    ~LumaWsClient();
 
     void init();
     void update();

@@ -55,7 +55,10 @@ class HeadLink:
     def connected(self) -> bool:
         return self.websocket is not None
 
-    async def connect(self, websocket: WebSocket, device_id: str, role: str, capabilities: list[str]) -> None:
+    async def connect(self, websocket: WebSocket, device_id: str, role: str, capabilities: list[str]) -> bool:
+        if self.websocket is not None and self.role == "device" and role == "simulator":
+            await websocket.close(code=1008, reason="physical device already connected")
+            return False
         if self.websocket is not None:
             try:
                 await self.websocket.close(code=1012)
@@ -66,6 +69,7 @@ class HeadLink:
         self.device_id = device_id
         self.role = role
         self.capabilities = capabilities
+        return True
 
     def disconnect(self, websocket: WebSocket) -> None:
         if websocket is self.websocket:
@@ -171,6 +175,8 @@ class LumaRuntime:
             settings.idle_expression_max_seconds,
         )
         self._last_idle_emotion = "idle"
+        self._ignored_voice_sessions: set[str] = set()
+        self._last_touch_wake_at = 0.0
 
     async def start(self) -> None:
         self._tasks = [
@@ -213,6 +219,28 @@ class LumaRuntime:
 
     def conversation_device_id(self) -> str:
         return self.state.device.device_id or "local"
+
+    def should_accept_wake(self, message: dict[str, Any]) -> tuple[bool, str]:
+        source = str(message.get("source", "wake_word"))
+        if source in {"touch", "wake_word"} and self.state.voice.phase != "idle":
+            return False, "voice_busy"
+        if source == "touch":
+            now = time.time()
+            if now - self._last_touch_wake_at < settings.touch_wake_cooldown_seconds:
+                return False, "touch_cooldown"
+            self._last_touch_wake_at = now
+        return True, ""
+
+    def ignore_voice_session(self, session_id: Any) -> None:
+        if isinstance(session_id, str) and session_id:
+            self._ignored_voice_sessions.add(session_id)
+
+    def voice_session_is_ignored(self, session_id: Any) -> bool:
+        return isinstance(session_id, str) and session_id in self._ignored_voice_sessions
+
+    def clear_ignored_voice_session(self, session_id: Any) -> None:
+        if isinstance(session_id, str):
+            self._ignored_voice_sessions.discard(session_id)
 
     async def _command_worker(self) -> None:
         while True:
@@ -287,7 +315,7 @@ class LumaRuntime:
         if not sent:
             status = {
                 "command_id": command["command_id"],
-                "error": {"code": "head_offline", "message": "No CoreS3 or simulator is connected.", "retryable": True},
+                "error": {"code": "head_offline", "message": "No CoreS3 device is connected.", "retryable": True},
             }
             self.head.resolve_pending(command["command_id"], status)
             self.head.clear_pending(command["command_id"])
@@ -525,7 +553,10 @@ def create_app() -> FastAPI:
             "input.touch_wake",
             "safety.estop",
         ]
-        await runtime.head.connect(websocket, device_id, role, default_capabilities)
+        accepted = await runtime.head.connect(websocket, device_id, role, default_capabilities)
+        if not accepted:
+            runtime.memory.log("head_rejected", {"device_id": device_id, "role": role, "reason": "physical_device_connected"})
+            return
         runtime.state.mark_connected(device_id, role, default_capabilities)
         runtime.memory.log("head_connected", {"device_id": device_id, "role": role, "capabilities": default_capabilities})
         await runtime.broadcast_state("head_connected")
@@ -582,14 +613,30 @@ async def _handle_head_message(raw: str) -> None:
     elif message_type == "telemetry":
         runtime.memory.log("head_telemetry", message)
     elif message_type == "wake_detected":
+        accepted, reason = runtime.should_accept_wake(message)
+        if not accepted:
+            session_id = message.get("session_id")
+            runtime.ignore_voice_session(session_id)
+            runtime.memory.log("voice_wake_ignored", {"reason": reason, "message": message})
+            if isinstance(session_id, str):
+                await runtime.head.send_json({"type": "cancel_session", "session_id": session_id, "reason": reason})
+            await runtime.broadcast_state("voice_wake_ignored")
+            return
         await runtime.voice.start(
             source=str(message.get("source", "wake_word")),
             wake_phrase=str(message.get("wake_phrase", "你好 Luma")),
             session_id=message.get("session_id") if isinstance(message.get("session_id"), str) else None,
         )
     elif message_type == "audio_begin":
+        if runtime.voice_session_is_ignored(message.get("session_id")):
+            runtime.memory.log("voice_audio_ignored", {"reason": "ignored_session", "message": message})
+            return
         await runtime.voice.begin_audio(message)
     elif message_type == "audio_end":
+        if runtime.voice_session_is_ignored(message.get("session_id")):
+            runtime.clear_ignored_voice_session(message.get("session_id"))
+            runtime.memory.log("voice_audio_ignored", {"reason": "ignored_session", "message": message})
+            return
         await runtime.voice.end_audio(message)
     elif message_type == "playback_done":
         await runtime.voice.playback_done(message)

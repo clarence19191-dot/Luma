@@ -12,16 +12,72 @@
 #include <cstdlib>
 #include <cstring>
 #include <hal/hal.h>
+#include <memory>
 #include <mooncake_log.h>
+#include <sdkconfig.h>
 #include <utility>
+
+#if defined(CONFIG_USE_CUSTOM_WAKE_WORD) && __has_include("wake_words/custom_wake_word.h")
+#include "wake_words/custom_wake_word.h"
+#define LUMA_HAS_CUSTOM_WAKE_WORD 1
+#else
+#define LUMA_HAS_CUSTOM_WAKE_WORD 0
+#endif
 
 namespace {
 
 constexpr const char* TAG = "LumaVoice";
+constexpr int kWakeWordSampleRateHz = 16000;
 
 std::string make_session_id()
 {
     return std::string("voice_") + std::to_string(GetHAL().millis());
+}
+
+void resample_interleaved(
+    const std::vector<int16_t>& input,
+    int input_rate_hz,
+    int channels,
+    int output_frames,
+    std::vector<int16_t>& output)
+{
+    channels = std::max(channels, 1);
+    if (output_frames <= 0) {
+        output.clear();
+        return;
+    }
+
+    output.resize(static_cast<size_t>(output_frames) * channels);
+    const int input_frames = static_cast<int>(input.size()) / channels;
+    if (input_frames <= 0) {
+        std::fill(output.begin(), output.end(), 0);
+        return;
+    }
+
+    if (input_rate_hz == kWakeWordSampleRateHz && input_frames >= output_frames) {
+        std::copy_n(input.begin(), output.size(), output.begin());
+        return;
+    }
+
+    for (int out_i = 0; out_i < output_frames; ++out_i) {
+        const uint64_t scaled = static_cast<uint64_t>(out_i) * static_cast<uint64_t>(input_rate_hz);
+        int base              = static_cast<int>(scaled / kWakeWordSampleRateHz);
+        uint64_t rem          = scaled % kWakeWordSampleRateHz;
+        if (base >= input_frames - 1) {
+            base = input_frames - 1;
+            rem  = 0;
+        }
+        const int next = std::min(base + 1, input_frames - 1);
+        for (int ch = 0; ch < channels; ++ch) {
+            const int16_t a = input[static_cast<size_t>(base) * channels + ch];
+            const int16_t b = input[static_cast<size_t>(next) * channels + ch];
+            const int32_t mixed =
+                static_cast<int32_t>((static_cast<int64_t>(a) * (kWakeWordSampleRateHz - rem) +
+                                      static_cast<int64_t>(b) * rem) /
+                                     kWakeWordSampleRateHz);
+            output[static_cast<size_t>(out_i) * channels + ch] = static_cast<int16_t>(mixed);
+        }
+    }
 }
 
 }  // namespace
@@ -44,11 +100,8 @@ LumaVoiceRuntime::~LumaVoiceRuntime()
 
 void LumaVoiceRuntime::init()
 {
-    _touch_signal_id = GetHAL().onHeadPetGesture.connect([this](HeadPetGesture gesture) {
-        if (gesture == HeadPetGesture::Release) {
-            requestWake("touch");
-        }
-    });
+    _touch_signal_id = GetHAL().onHeadPetGesture.connect([this](HeadPetGesture gesture) { handleTouchGesture(gesture); });
+    startWakeWordDetection();
     setStatus("Voice ready");
 }
 
@@ -58,9 +111,11 @@ void LumaVoiceRuntime::stop()
         GetHAL().onHeadPetGesture.disconnect(_touch_signal_id);
         _touch_signal_id = -1;
     }
+    stopWakeWordDetection();
     stopCapture();
     stopPlayback(false);
-    for (int i = 0; i < 100 && (_capture_task != nullptr || _playback_task != nullptr); ++i) {
+    for (int i = 0; i < 100 && (_capture_task != nullptr || _playback_task != nullptr || _wake_word_task != nullptr);
+         ++i) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -78,6 +133,10 @@ void LumaVoiceRuntime::requestWake(std::string_view source)
 {
     if (_capture_active.load() || _playback_active.load()) {
         return;
+    }
+    if (source != "wake_word") {
+        _wake_word_paused = true;
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
     _session_id = make_session_id();
     sendJsonf(
@@ -215,6 +274,64 @@ void LumaVoiceRuntime::setEmotion(std::string_view emotion)
     }
 }
 
+void LumaVoiceRuntime::handleTouchGesture(HeadPetGesture gesture)
+{
+    const uint32_t now = GetHAL().millis();
+    if (gesture == HeadPetGesture::Press) {
+        _touch_pressed = true;
+        _touch_swiped = false;
+        _touch_press_ms = now;
+        return;
+    }
+    if (gesture == HeadPetGesture::SwipeForward || gesture == HeadPetGesture::SwipeBackward) {
+        _touch_swiped = true;
+        return;
+    }
+    if (gesture != HeadPetGesture::Release) {
+        return;
+    }
+
+    const bool was_pressed = _touch_pressed;
+    const bool was_swiped = _touch_swiped;
+    const uint32_t held_ms = now - _touch_press_ms;
+    const uint32_t since_last_wake_ms = now - _last_touch_wake_ms;
+    _touch_pressed = false;
+    _touch_swiped = false;
+
+    if (!was_pressed || was_swiped) {
+        _last_touch_tap_ms = 0;
+        return;
+    }
+    if (held_ms < kTouchTapMinPressMs || held_ms > kTouchTapMaxPressMs) {
+        _last_touch_tap_ms = 0;
+        return;
+    }
+    if (_capture_active.load() || _playback_active.load()) {
+        _last_touch_tap_ms = 0;
+        return;
+    }
+    if (_last_touch_wake_ms != 0 && since_last_wake_ms < kTouchWakeCooldownMs) {
+        _last_touch_tap_ms = 0;
+        return;
+    }
+
+    if (_last_touch_tap_ms != 0) {
+        const uint32_t tap_gap_ms = now - _last_touch_tap_ms;
+        if (tap_gap_ms >= kTouchDoubleTapMinGapMs && tap_gap_ms <= kTouchDoubleTapMaxGapMs) {
+            _last_touch_tap_ms = 0;
+            _last_touch_wake_ms = now;
+            requestWake("touch");
+            return;
+        }
+        if (tap_gap_ms < kTouchDoubleTapMinGapMs) {
+            return;
+        }
+    }
+
+    _last_touch_tap_ms = now;
+    setStatus("Double tap to wake");
+}
+
 void LumaVoiceRuntime::captureTaskThunk(void* arg)
 {
     static_cast<LumaVoiceRuntime*>(arg)->captureLoop();
@@ -223,6 +340,30 @@ void LumaVoiceRuntime::captureTaskThunk(void* arg)
 void LumaVoiceRuntime::playbackTaskThunk(void* arg)
 {
     static_cast<LumaVoiceRuntime*>(arg)->playbackLoop();
+}
+
+void LumaVoiceRuntime::wakeWordTaskThunk(void* arg)
+{
+    static_cast<LumaVoiceRuntime*>(arg)->wakeWordLoop();
+}
+
+void LumaVoiceRuntime::startWakeWordDetection()
+{
+#if LUMA_HAS_CUSTOM_WAKE_WORD
+    if (_wake_word_active.exchange(true)) {
+        return;
+    }
+    _wake_word_paused = false;
+    xTaskCreatePinnedToCore(wakeWordTaskThunk, "luma_wake_word", 8192, this, 3, &_wake_word_task, 0);
+#else
+    mclog::tagWarn(TAG, "custom wake word support is not compiled in");
+#endif
+}
+
+void LumaVoiceRuntime::stopWakeWordDetection()
+{
+    _wake_word_active = false;
+    _wake_word_paused = true;
 }
 
 void LumaVoiceRuntime::captureLoop()
@@ -294,6 +435,93 @@ void LumaVoiceRuntime::captureLoop()
     sendJsonf("{\"type\":\"audio_end\",\"session_id\":\"%s\",\"chunks\":%d}", _session_id.c_str(), chunks_read);
     _capture_task = nullptr;
     vTaskDelete(nullptr);
+}
+
+void LumaVoiceRuntime::wakeWordLoop()
+{
+#if LUMA_HAS_CUSTOM_WAKE_WORD
+    auto audio_codec = Board::GetInstance().GetAudioCodec();
+    if (!audio_codec) {
+        mclog::tagError(TAG, "audio codec unavailable for wake word");
+        _wake_word_active = false;
+        _wake_word_task   = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    auto wake_word = std::make_unique<CustomWakeWord>();
+    if (!wake_word->Initialize(audio_codec, nullptr)) {
+        mclog::tagWarn(TAG, "custom wake word initialization failed");
+        setStatus("Touch wake ready");
+        _wake_word_active = false;
+        _wake_word_task   = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    std::atomic<bool> detected = false;
+    wake_word->OnWakeWordDetected([&detected](const std::string&) { detected = true; });
+
+    const int input_channels = std::max(audio_codec->input_channels(), 1);
+    const int input_rate     = std::max(audio_codec->input_sample_rate(), kWakeWordSampleRateHz);
+    const int feed_frames    = static_cast<int>(wake_word->GetFeedSize());
+    const int input_frames   = std::max(1, feed_frames * input_rate / kWakeWordSampleRateHz);
+
+    std::vector<int16_t> input_chunk(static_cast<size_t>(input_frames) * input_channels);
+    std::vector<int16_t> wake_chunk;
+    bool detector_running = false;
+
+    while (_wake_word_active.load()) {
+        if (_wake_word_paused.load() || _capture_active.load() || _playback_active.load()) {
+            if (detector_running) {
+                wake_word->Stop();
+                detector_running = false;
+                audio_codec->EnableInput(false);
+            }
+            if (!_capture_active.load() && !_playback_active.load()) {
+                _wake_word_paused = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (!detector_running) {
+            wake_word->Start();
+            detector_running = true;
+            audio_codec->EnableInput(true);
+            setStatus("Voice ready");
+        }
+
+        if (!audio_codec->InputData(input_chunk)) {
+            mclog::tagWarn(TAG, "wake word input chunk failed");
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        resample_interleaved(input_chunk, input_rate, input_channels, feed_frames, wake_chunk);
+        wake_word->Feed(wake_chunk);
+
+        if (detected.exchange(false)) {
+            mclog::tagInfo(TAG, "wake word detected");
+            wake_word->Stop();
+            detector_running = false;
+            audio_codec->EnableInput(false);
+            _wake_word_paused = true;
+            setStatus("Wake word");
+            requestWake("wake_word");
+        }
+    }
+
+    if (detector_running) {
+        wake_word->Stop();
+        audio_codec->EnableInput(false);
+    }
+    _wake_word_task = nullptr;
+    vTaskDelete(nullptr);
+#else
+    _wake_word_task = nullptr;
+    vTaskDelete(nullptr);
+#endif
 }
 
 void LumaVoiceRuntime::playbackLoop()

@@ -1,0 +1,8 @@
+.pio/
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+components/
+xiaozhi-esp32/
+include/secrets.h

@@ -15,6 +15,7 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <hal/hal.h>
 
 namespace luma {
 
@@ -43,6 +44,11 @@ private:
     static constexpr int kMaxRecordMs = 8000;
     static constexpr int kSilenceStopMs = 1200;
     static constexpr int kMaxPlaybackQueueChunks = 5;
+    static constexpr uint32_t kTouchWakeCooldownMs = 5000;
+    static constexpr uint32_t kTouchTapMinPressMs = 50;
+    static constexpr uint32_t kTouchTapMaxPressMs = 700;
+    static constexpr uint32_t kTouchDoubleTapMinGapMs = 80;
+    static constexpr uint32_t kTouchDoubleTapMaxGapMs = 650;
 
     JsonSender _json_sender;
     BinarySender _binary_sender;
@@ -53,9 +59,17 @@ private:
     std::atomic<bool> _playback_active{false};
     std::atomic<bool> _playback_finishing{false};
     std::atomic<bool> _playback_notify_done{true};
+    std::atomic<bool> _wake_word_active{false};
+    std::atomic<bool> _wake_word_paused{false};
     TaskHandle_t _capture_task = nullptr;
     TaskHandle_t _playback_task = nullptr;
+    TaskHandle_t _wake_word_task = nullptr;
     int _touch_signal_id = -1;
+    bool _touch_pressed = false;
+    bool _touch_swiped = false;
+    uint32_t _touch_press_ms = 0;
+    uint32_t _last_touch_tap_ms = 0;
+    uint32_t _last_touch_wake_ms = 0;
     std::string _session_id;
 
     std::mutex _playback_mutex;
@@ -70,11 +84,16 @@ private:
     void sendJsonf(const char* fmt, ...);
     void setStatus(std::string_view status);
     void setEmotion(std::string_view emotion);
+    void handleTouchGesture(HeadPetGesture gesture);
 
     static void captureTaskThunk(void* arg);
     static void playbackTaskThunk(void* arg);
+    static void wakeWordTaskThunk(void* arg);
+    void startWakeWordDetection();
+    void stopWakeWordDetection();
     void captureLoop();
     void playbackLoop();
+    void wakeWordLoop();
 };
 
 }  // namespace luma

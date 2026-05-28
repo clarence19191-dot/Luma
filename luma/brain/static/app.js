@@ -1,14 +1,8 @@
 const state = {
   consoleSocket: null,
-  headSocket: null,
-  headHeartbeat: null,
   emotion: "idle",
   emotions: [],
   metadataRefreshAt: 0,
-  incomingAudioBytes: 0,
-  incomingSessionId: null,
-  incomingQgifBytes: 0,
-  incomingQgif: null,
 };
 
 const els = {
@@ -34,7 +28,7 @@ const els = {
   sendBtn: document.getElementById("sendBtn"),
   voiceTextBtn: document.getElementById("voiceTextBtn"),
   wakeBtn: document.getElementById("wakeBtn"),
-  simAudioBtn: document.getElementById("simAudioBtn"),
+  cancelVoiceBtn: document.getElementById("cancelVoiceBtn"),
   estopBtn: document.getElementById("estopBtn"),
   resetBtn: document.getElementById("resetBtn"),
   clearLogBtn: document.getElementById("clearLogBtn"),
@@ -69,60 +63,6 @@ function connectConsole() {
   state.consoleSocket.onclose = () => setTimeout(connectConsole, 1000);
 }
 
-function connectSimulatorHead() {
-  state.headSocket = new WebSocket(wsUrl("/ws/head?device_id=luma-browser-sim&role=simulator"));
-  state.headSocket.binaryType = "arraybuffer";
-  state.headSocket.onopen = () => {
-    state.headSocket.send(JSON.stringify({
-      type: "hello",
-      device_id: "luma-browser-sim",
-      role: "simulator",
-      capabilities: [
-        "display.lvgl_face",
-        "display.qgif_stream",
-        "audio.wake_word",
-        "audio.capture_pcm",
-        "audio.playback_pcm",
-        "input.touch_wake",
-        "safety.estop",
-      ],
-    }));
-    if (state.headHeartbeat) clearInterval(state.headHeartbeat);
-    state.headHeartbeat = setInterval(() => {
-      if (state.headSocket && state.headSocket.readyState === WebSocket.OPEN) {
-        state.headSocket.send(JSON.stringify({ type: "telemetry", battery: 100, ts: Date.now() / 1000 }));
-      }
-    }, 1000);
-  };
-  state.headSocket.onmessage = async (event) => {
-    if (typeof event.data !== "string") {
-      const bytes = event.data.byteLength || event.data.size || 0;
-      if (state.incomingQgif) {
-        state.incomingQgifBytes += bytes;
-        els.audioState.textContent = `qgif ${formatBytes(state.incomingQgifBytes)}`;
-      } else {
-        state.incomingAudioBytes += bytes;
-        els.audioState.textContent = formatBytes(state.incomingAudioBytes);
-      }
-      return;
-    }
-    const message = JSON.parse(event.data);
-    if (message.type === "command") {
-      const command = message.command;
-      sendHeadStatus("ack", command.command_id);
-      await applySimCommand(command);
-      sendHeadStatus("done", command.command_id);
-      return;
-    }
-    await applySimControl(message);
-  };
-  state.headSocket.onclose = () => {
-    if (state.headHeartbeat) clearInterval(state.headHeartbeat);
-    state.headHeartbeat = null;
-    setTimeout(connectSimulatorHead, 1000);
-  };
-}
-
 async function loadEmotionPalette() {
   try {
     const response = await fetch("/api/emotions");
@@ -149,76 +89,6 @@ function renderEmotionPalette() {
   });
 }
 
-function sendHeadStatus(type, commandId) {
-  if (!socketOpen()) return;
-  state.headSocket.send(JSON.stringify({ type, command_id: commandId, ts: Date.now() / 1000 }));
-}
-
-function socketOpen() {
-  return state.headSocket && state.headSocket.readyState === WebSocket.OPEN;
-}
-
-async function applySimCommand(command) {
-  if (command.type === "set_emotion") {
-    renderEmotion(command.emotion);
-    await wait(command.duration_ms || 250);
-  } else if (command.type === "speak") {
-    renderEmotion(command.emotion || "speaking");
-    renderSpeech(command.text);
-    await wait(Math.min(Math.max(command.text.length * 120, 600), 4000));
-    renderSpeech("");
-  } else if (command.type === "estop") {
-    renderSpeech("");
-    renderEmotion("idle");
-  }
-}
-
-async function applySimControl(message) {
-  if (message.type === "set_emotion") {
-    renderEmotion(message.emotion || "idle");
-  } else if (message.type === "qgif_begin") {
-    state.incomingQgif = message;
-    state.incomingQgifBytes = 0;
-    els.audioState.textContent = `qgif 0 B`;
-  } else if (message.type === "qgif_end") {
-    if (state.incomingQgif) {
-      renderEmotion(state.incomingQgif.emotion || message.emotion || "idle");
-    }
-    state.incomingQgif = null;
-    state.incomingQgifBytes = 0;
-  } else if (message.type === "qgif_cancel") {
-    state.incomingQgif = null;
-    state.incomingQgifBytes = 0;
-  } else if (message.type === "start_listening") {
-    state.incomingAudioBytes = 0;
-    state.incomingSessionId = message.session_id || null;
-    renderEmotion("listening");
-    renderSpeech("...");
-  } else if (message.type === "play_audio_begin") {
-    state.incomingAudioBytes = 0;
-    state.incomingSessionId = message.session_id || null;
-    renderEmotion("speaking");
-    renderSpeech("speaking");
-  } else if (message.type === "play_audio_end") {
-    renderSpeech("");
-    if (socketOpen()) {
-      state.headSocket.send(JSON.stringify({
-        type: "playback_done",
-        session_id: message.session_id || state.incomingSessionId,
-        bytes: state.incomingAudioBytes,
-      }));
-    }
-  } else if (message.type === "cancel_session") {
-    state.incomingAudioBytes = 0;
-    renderSpeech("");
-    renderEmotion("idle");
-  }
-}
-
-function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function renderState(nextState) {
   const voice = nextState.voice || {};
   els.deviceState.textContent = nextState.device.connected ? `${nextState.device.role || "device"}` : "offline";
@@ -229,7 +99,7 @@ function renderState(nextState) {
   els.behaviorState.textContent = voice.pet_behavior || "-";
   els.boundaryState.textContent = voice.boundary ? voice.boundary.decision : "-";
   els.queueState.textContent = nextState.device.queue_length;
-  els.audioState.textContent = formatBytes(voice.audio_bytes || state.incomingAudioBytes || 0);
+  els.audioState.textContent = formatBytes(voice.audio_bytes || 0);
   els.memoryState.textContent = String(voice.memory_count || 0);
   els.transcriptBox.textContent = voice.transcript || "Transcript";
   els.replyText.textContent = voice.error ? `${voice.error.code}: ${voice.error.message}` : (voice.reply || "Reply");
@@ -324,33 +194,14 @@ async function wakeVoice() {
   }
 }
 
-async function simulateAudioTurn() {
-  if (!socketOpen()) {
-    logEvent("sim_audio_error", "head simulator is offline");
-    return;
+async function cancelVoice() {
+  try {
+    const result = await postJson("/api/voice/cancel", {});
+    logEvent("voice_cancel", result);
+    scheduleMetadataRefresh(true);
+  } catch (error) {
+    logEvent("voice_cancel_error", String(error));
   }
-  const sessionId = `sim_${Date.now()}`;
-  state.headSocket.send(JSON.stringify({
-    type: "wake_detected",
-    source: "simulator",
-    wake_phrase: "你好 Luma",
-    session_id: sessionId,
-  }));
-  await wait(120);
-  state.headSocket.send(JSON.stringify({
-    type: "audio_begin",
-    session_id: sessionId,
-    sample_rate_hz: 24000,
-    channels: 1,
-    encoding: "pcm_s16le",
-  }));
-  const chunk = makeToneChunk(24000, 40, 420);
-  for (let i = 0; i < 25; i += 1) {
-    state.headSocket.send(chunk);
-    await wait(12);
-  }
-  state.headSocket.send(JSON.stringify({ type: "audio_end", session_id: sessionId }));
-  logEvent("sim_audio_sent", { session_id: sessionId, chunks: 25 });
 }
 
 function scheduleMetadataRefresh(force = false) {
@@ -420,15 +271,6 @@ function renderMemories(memories) {
   });
 }
 
-function makeToneChunk(sampleRate, ms, hz) {
-  const samples = Math.floor(sampleRate * ms / 1000);
-  const data = new Int16Array(samples);
-  for (let i = 0; i < samples; i += 1) {
-    data[i] = Math.sin((i / sampleRate) * hz * Math.PI * 2) * 6000;
-  }
-  return data.buffer;
-}
-
 document.querySelectorAll("[data-command]").forEach((button) => {
   button.addEventListener("click", () => sendCommand(JSON.parse(button.dataset.command)));
 });
@@ -443,7 +285,7 @@ els.sendBtn.addEventListener("click", () => {
 
 els.voiceTextBtn.addEventListener("click", sendVoiceText);
 els.wakeBtn.addEventListener("click", wakeVoice);
-els.simAudioBtn.addEventListener("click", simulateAudioTurn);
+els.cancelVoiceBtn.addEventListener("click", cancelVoice);
 
 els.estopBtn.addEventListener("click", async () => {
   await postJson("/api/estop", {});
@@ -472,4 +314,3 @@ els.refreshMemoryBtn.addEventListener("click", () => scheduleMetadataRefresh(tru
 loadEmotionPalette();
 scheduleMetadataRefresh(true);
 connectConsole();
-connectSimulatorHead();

@@ -2,6 +2,7 @@
  * Project Luma V0 head application.
  */
 #include "app_luma.h"
+#include "luma_config.h"
 #include "luma_qgif_player.h"
 #include "luma_voice_runtime.h"
 #include "luma_ws_client.h"
@@ -14,6 +15,13 @@
 #include <smooth_lvgl.hpp>
 #include <stackchan/stackchan.h>
 #include <string>
+
+#if __has_include(<ssid_manager.h>)
+#include <ssid_manager.h>
+#define LUMA_HAS_SSID_MANAGER 1
+#else
+#define LUMA_HAS_SSID_MANAGER 0
+#endif
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
@@ -112,6 +120,8 @@ AppLuma::AppLuma()
     setAppInfo().userData       = (void*)&theme_color;
 }
 
+AppLuma::~AppLuma() = default;
+
 void AppLuma::onCreate()
 {
     mclog::tagInfo(getAppInfo().name, "on create");
@@ -121,29 +131,32 @@ void AppLuma::onOpen()
 {
     mclog::tagInfo(getAppInfo().name, "on open");
 
-    LvglLockGuard lock;
+    {
+        LvglLockGuard lock;
 
-    auto avatar = std::make_unique<avatar::DefaultAvatar>();
-    avatar->init(lv_screen_active());
-    GetStackChan().attachAvatar(std::move(avatar));
+        auto avatar = std::make_unique<avatar::DefaultAvatar>();
+        avatar->init(lv_screen_active());
+        GetStackChan().attachAvatar(std::move(avatar));
 
-    _title = std::make_unique<Label>(lv_screen_active());
-    _title->setText("LUMA");
-    _title->setTextColor(lv_color_hex(0x1E252B));
-    _title->align(LV_ALIGN_TOP_MID, 0, 8);
+        _title = std::make_unique<Label>(lv_screen_active());
+        _title->setText("LUMA");
+        _title->setTextColor(lv_color_hex(0x1E252B));
+        _title->align(LV_ALIGN_TOP_MID, 0, 8);
 
-    _status = std::make_unique<Label>(lv_screen_active());
-    _status->setText("Ready");
-    _status->setTextColor(lv_color_hex(0x4B5963));
-    _status->align(LV_ALIGN_BOTTOM_MID, 0, -8);
+        _status = std::make_unique<Label>(lv_screen_active());
+        _status->setText("Connecting WiFi");
+        _status->setTextColor(lv_color_hex(0x4B5963));
+        _status->align(LV_ALIGN_BOTTOM_MID, 0, -8);
 
-    _qgif_player = std::make_unique<luma::LumaQgifPlayer>();
-    if (_qgif_player->init(lv_screen_active(), 320, 240)) {
-        _qgif_player->play("sys_idle.qgif");
-    } else {
-        _qgif_player.reset();
+        _qgif_player = std::make_unique<luma::LumaQgifPlayer>();
+        if (_qgif_player->init(lv_screen_active(), 320, 240)) {
+            _qgif_player->play("sys_idle.qgif");
+        } else {
+            _qgif_player.reset();
+        }
     }
 
+    configureNetworkFromSecrets();
     GetHAL().startNetwork([this](std::string_view msg) { queueStatus(msg); });
     _ws_client = std::make_unique<luma::LumaWsClient>(
         [this](std::string_view command) { return applyCommandJson(command); },
@@ -170,6 +183,28 @@ void AppLuma::onOpen()
         [this](std::string_view status) { queueStatus(status); });
     _voice_runtime->init();
     _ws_client->init();
+}
+
+void AppLuma::configureNetworkFromSecrets()
+{
+    if (!luma::config::hasWifiCredentials()) {
+        if (!luma::config::hasSecretsFile()) {
+            mclog::tagWarn(getAppInfo().name, "secrets.h not found; using existing WiFi provisioning");
+        } else {
+            mclog::tagWarn(getAppInfo().name, "WIFI_SSID is empty; using existing WiFi provisioning");
+        }
+        queueStatus("WiFi setup required");
+        return;
+    }
+
+#if LUMA_HAS_SSID_MANAGER
+    SsidManager::GetInstance().AddSsid(luma::config::wifiSsid(), luma::config::wifiPass());
+    mclog::tagInfo(getAppInfo().name, "loaded WiFi credentials for {}", luma::config::wifiSsid());
+    queueStatus("WiFi configured");
+#else
+    mclog::tagWarn(getAppInfo().name, "ssid_manager.h not available; cannot preload WiFi credentials");
+    queueStatus("WiFi manager unavailable");
+#endif
 }
 
 void AppLuma::onRunning()

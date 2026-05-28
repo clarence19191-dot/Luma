@@ -2,6 +2,7 @@
  * Project Luma V0 text WebSocket client for Brain.
  */
 #include "luma_ws_client.h"
+#include "luma_config.h"
 
 #include <ArduinoJson.hpp>
 #include <board.h>
@@ -24,6 +25,8 @@ LumaWsClient::LumaWsClient(CommandHandler command_handler, ControlHandler contro
       _binary_handler(std::move(binary_handler))
 {
 }
+
+LumaWsClient::~LumaWsClient() = default;
 
 void LumaWsClient::init()
 {
@@ -172,6 +175,11 @@ void LumaWsClient::sendStatus(std::string_view type, std::string_view command_id
 
 std::string LumaWsClient::getBrainUrl() const
 {
+    auto secret_url = config::brainWsUrl();
+    if (!secret_url.empty()) {
+        return secret_url;
+    }
+
     Settings settings("luma", false);
     return settings.GetString(
         "brain_ws_url",

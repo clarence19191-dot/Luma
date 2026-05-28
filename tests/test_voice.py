@@ -20,6 +20,7 @@ from luma.brain.voice import (
     VoiceSessionRuntime,
     make_stt_provider,
     make_tts_provider,
+    _parse_sherpa_transcript,
 )
 
 
@@ -29,10 +30,21 @@ class FakeSTTProvider:
         return "你好 Luma"
 
 
+class EmptySTTProvider:
+    async def transcribe(self, audio: AudioBuffer) -> str:
+        self.last_audio = audio
+        return ""
+
+
 class FakeLLMProvider:
     async def decide(self, messages):
         self.last_messages = messages
         return fallback_decision("你回来了。", emotion="happy", tone="warm", pet_behavior="greet")
+
+
+class FailingLLMProvider:
+    async def decide(self, messages):
+        raise AssertionError("LLM should not run for empty speech")
 
 
 class FakeTTSProvider:
@@ -117,11 +129,36 @@ class VoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["voice"]["phase"], "error")
         self.assertEqual(snapshot["voice"]["error"]["code"], "empty_audio")
 
+    async def test_empty_transcript_does_not_call_llm_or_tts(self):
+        runtime = VoiceSessionRuntime(
+            self.state,
+            self.memory,
+            self.send_json,
+            self.send_bytes,
+            self.broadcast_state,
+            stt_provider=EmptySTTProvider(),
+            llm_provider=FailingLLMProvider(),
+            tts_provider=FakeTTSProvider(),
+        )
+        session_id = await runtime.start(source="test")
+        await runtime.begin_audio({"type": "audio_begin", "session_id": session_id})
+        await runtime.accept_audio_chunk(b"\x00\x00" * 2400)
+        await runtime.end_audio({"type": "audio_end", "session_id": session_id})
+        await runtime._processing_task
+
+        self.assertEqual(self.state.snapshot()["voice"]["phase"], "idle")
+        self.assertFalse(self.sent_bytes)
+        self.assertTrue(any(message["type"] == "cancel_session" and message["reason"] == "no_speech" for message in self.sent_json))
+
     def test_pcm_buffer_can_be_wrapped_as_wav(self):
         audio = AudioBuffer(pcm=b"\x00\x00" * 240, format=AudioFormat(sample_rate_hz=24000, channels=1))
         wav = audio.to_wav_bytes()
         self.assertTrue(wav.startswith(b"RIFF"))
         self.assertIn(b"WAVE", wav[:16])
+
+    def test_empty_sherpa_json_does_not_become_transcript(self):
+        output = '{ "text": "", "tokens": [], "is_final": false }'
+        self.assertEqual(_parse_sherpa_transcript(output), "")
 
 
 class LocalSpeechProviderTests(unittest.IsolatedAsyncioTestCase):

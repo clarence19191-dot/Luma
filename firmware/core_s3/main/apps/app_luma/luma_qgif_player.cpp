@@ -39,7 +39,7 @@ bool LumaQgifPlayer::init(lv_obj_t* parent, uint16_t target_width, uint16_t targ
         _framebuffer = static_cast<uint16_t*>(heap_caps_malloc(framebuffer_bytes, MALLOC_CAP_8BIT));
     }
     if (!_framebuffer) {
-        mooncake::mclog::tagError(TAG, "failed to allocate {} bytes framebuffer", framebuffer_bytes);
+        mclog::tagError(TAG, "failed to allocate {} bytes framebuffer", framebuffer_bytes);
         return false;
     }
 
@@ -153,14 +153,14 @@ bool LumaQgifPlayer::setAsset(std::string_view asset_name, const uint8_t* data, 
 
     AssetView parsed;
     if (!parseAsset(_asset_storage.data(), _asset_storage.size(), parsed)) {
-        mooncake::mclog::tagWarn(TAG, "invalid streamed qgif {} size {}", asset_name, size);
+        mclog::tagWarn(TAG, "invalid streamed qgif {} size {}", asset_name, size);
         _asset_storage.clear();
         _asset = {};
         return false;
     }
     _asset = parsed;
     _asset_name.assign(asset_name.data(), asset_name.size());
-    mooncake::mclog::tagInfo(TAG, "streamed {}: {}x{} {} frames", asset_name, _asset.width, _asset.height, _asset.frame_count);
+    mclog::tagInfo(TAG, "streamed {}: {}x{} {} frames", asset_name, _asset.width, _asset.height, _asset.frame_count);
     return true;
 }
 

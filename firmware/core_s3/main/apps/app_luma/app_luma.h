@@ -20,6 +20,7 @@ class LumaVoiceRuntime;
 class AppLuma : public mooncake::AppAbility {
 public:
     AppLuma();
+    ~AppLuma() override;
 
     void onCreate() override;
     void onOpen() override;
@@ -29,8 +30,8 @@ public:
     bool applyCommandJson(std::string_view json);
 
 private:
-    std::unique_ptr<uitk::lvgl_cpp::Label> _title;
-    std::unique_ptr<uitk::lvgl_cpp::Label> _status;
+    std::unique_ptr<smooth_ui_toolkit::lvgl_cpp::Label> _title;
+    std::unique_ptr<smooth_ui_toolkit::lvgl_cpp::Label> _status;
     std::unique_ptr<luma::LumaQgifPlayer> _qgif_player;
     std::unique_ptr<luma::LumaWsClient> _ws_client;
     std::unique_ptr<luma::LumaVoiceRuntime> _voice_runtime;
@@ -47,6 +48,7 @@ private:
     bool _has_pending_status = false;
     uint32_t _last_status_tick = 0;
 
+    void configureNetworkFromSecrets();
     void applyEmotion(std::string_view emotion, uint32_t duration_ms, std::string_view asset_name = {});
     void applySpeak(std::string_view text);
     void applyControlJson(std::string_view json);
