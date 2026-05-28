@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: MIT
  */
 #pragma once
-#include "camera.h"
 #include <cstdint>
 #include <lvgl.h>
 #include <driver/i2c_master.h>
@@ -53,7 +52,6 @@ XiaozhiConfig_t get_xiaozhi_config();
 void set_xiaozhi_config(const XiaozhiConfig_t& config);
 
 i2c_master_bus_handle_t board_get_i2c_bus();
-Camera* board_get_camera();
 int board_get_battery_level();
 bool board_is_battery_charging();
 void board_set_backlight_brightness(uint8_t brightness, bool permanent = false);

@@ -10,7 +10,7 @@
 #include <memory>
 #include <sys/time.h>
 #include <ctime>
-#include <settings.h>
+#include <luma_platform/settings.h>
 #include <esp_log.h>
 
 static const std::string_view _tag = "HAL-RTC";

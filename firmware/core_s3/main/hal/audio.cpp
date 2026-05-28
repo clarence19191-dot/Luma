@@ -7,12 +7,12 @@
 #include <algorithm>
 #include <array>
 #include <esp_heap_caps.h>
-#include <mooncake_log.h>
-#include <memory>
-#include <vector>
-#include <board.h>
-#include <audio/audio_codec.h>
 #include <hal/board/config.h>
+#include <luma_platform/audio_codec.h>
+#include <luma_platform/board.h>
+#include <memory>
+#include <mooncake_log.h>
+#include <vector>
 
 static const std::string_view _tag = "HAL-Audio";
 

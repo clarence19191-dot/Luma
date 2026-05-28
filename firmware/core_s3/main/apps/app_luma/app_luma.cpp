@@ -8,51 +8,18 @@
 #include "luma_ws_client.h"
 
 #include <ArduinoJson.hpp>
-#include <assets/assets.h>
 #include <cstring>
 #include <hal/hal.h>
+#include <luma_platform/board.h>
+#include <luma_platform/settings.h>
 #include <mooncake_log.h>
 #include <smooth_lvgl.hpp>
-#include <stackchan/stackchan.h>
 #include <string>
-
-#if __has_include(<ssid_manager.h>)
-#include <ssid_manager.h>
-#define LUMA_HAS_SSID_MANAGER 1
-#else
-#define LUMA_HAS_SSID_MANAGER 0
-#endif
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
-using namespace stackchan;
 
 namespace {
-
-avatar::Emotion map_emotion(std::string_view emotion)
-{
-    if (emotion == "happy" || emotion == "smile" || emotion == "speaking" || emotion == "uwu" ||
-        emotion == "love" || emotion == "smirk" || emotion == "wink") {
-        return avatar::Emotion::Happy;
-    }
-    if (emotion == "angry" || emotion == "angry_fire" || emotion == "frustrated" || emotion == "devil") {
-        return avatar::Emotion::Angry;
-    }
-    if (emotion == "scared" || emotion == "cry" || emotion == "dizzy") {
-        return avatar::Emotion::Sad;
-    }
-    if (emotion == "thinking" || emotion == "curious" || emotion == "surprised" || emotion == "distracted" ||
-        emotion == "peek" || emotion == "squint" || emotion == "look_left" || emotion == "look_right") {
-        return avatar::Emotion::Doubt;
-    }
-    if (emotion == "listening") {
-        return avatar::Emotion::Doubt;
-    }
-    if (emotion == "relaxed" || emotion == "sleepy" || emotion == "yawn") {
-        return avatar::Emotion::Sleepy;
-    }
-    return avatar::Emotion::Neutral;
-}
 
 const char* qgif_asset_for_emotion(std::string_view emotion)
 {
@@ -114,8 +81,6 @@ uint32_t estimate_speech_ms(std::string_view text)
 AppLuma::AppLuma()
 {
     setAppInfo().name = "LUMA";
-    static auto icon  = assets::get_image("icon_ai_agent.bin");
-    setAppInfo().icon = (void*)&icon;
     static uint32_t theme_color = 0x5FB7FF;
     setAppInfo().userData       = (void*)&theme_color;
 }
@@ -133,10 +98,6 @@ void AppLuma::onOpen()
 
     {
         LvglLockGuard lock;
-
-        auto avatar = std::make_unique<avatar::DefaultAvatar>();
-        avatar->init(lv_screen_active());
-        GetStackChan().attachAvatar(std::move(avatar));
 
         _title = std::make_unique<Label>(lv_screen_active());
         _title->setText("LUMA");
@@ -189,22 +150,22 @@ void AppLuma::configureNetworkFromSecrets()
 {
     if (!luma::config::hasWifiCredentials()) {
         if (!luma::config::hasSecretsFile()) {
-            mclog::tagWarn(getAppInfo().name, "secrets.h not found; using existing WiFi provisioning");
+            mclog::tagWarn(getAppInfo().name, "secrets.h not found; WiFi credentials must already exist in NVS");
         } else {
-            mclog::tagWarn(getAppInfo().name, "WIFI_SSID is empty; using existing WiFi provisioning");
+            mclog::tagWarn(getAppInfo().name, "WIFI_SSID is empty; WiFi credentials must already exist in NVS");
         }
         queueStatus("WiFi setup required");
         return;
     }
 
-#if LUMA_HAS_SSID_MANAGER
-    SsidManager::GetInstance().AddSsid(luma::config::wifiSsid(), luma::config::wifiPass());
+    {
+        Settings settings("wifi", true);
+        settings.SetString("ssid", luma::config::wifiSsid());
+        settings.SetString("password", luma::config::wifiPass());
+    }
+    Board::GetInstance().SetWifiCredentials(luma::config::wifiSsid(), luma::config::wifiPass());
     mclog::tagInfo(getAppInfo().name, "loaded WiFi credentials for {}", luma::config::wifiSsid());
     queueStatus("WiFi configured");
-#else
-    mclog::tagWarn(getAppInfo().name, "ssid_manager.h not available; cannot preload WiFi credentials");
-    queueStatus("WiFi manager unavailable");
-#endif
 }
 
 void AppLuma::onRunning()
@@ -213,9 +174,6 @@ void AppLuma::onRunning()
     processPendingUi();
     if (_qgif_player) {
         _qgif_player->update(GetHAL().millis());
-    }
-    if (!_qgif_player || !_qgif_player->visible()) {
-        GetStackChan().update();
     }
     if (_ws_client) {
         _ws_client->update();
@@ -242,7 +200,6 @@ void AppLuma::onClose()
     _qgif_player.reset();
     _title.reset();
     _status.reset();
-    GetStackChan().resetAvatar();
 }
 
 bool AppLuma::applyCommandJson(std::string_view json)
@@ -278,7 +235,6 @@ bool AppLuma::applyCommandJson(std::string_view json)
         if (_voice_runtime) {
             _voice_runtime->handleControlJson("{\"type\":\"cancel_session\"}");
         }
-        GetStackChan().clearModifiers();
         if (_qgif_player) {
             _qgif_player->stop();
         }
@@ -313,13 +269,6 @@ void AppLuma::applyEmotion(std::string_view emotion, uint32_t duration_ms, std::
         }
     }
 
-    if (GetStackChan().hasAvatar()) {
-        if (duration_ms > 0 && !qgif_playing) {
-            GetStackChan().addModifier(std::make_unique<TimedEmotionModifier>(map_emotion(emotion), duration_ms));
-        } else {
-            GetStackChan().avatar().setEmotion(map_emotion(emotion));
-        }
-    }
     setStatus(emotion);
 }
 
@@ -333,9 +282,6 @@ void AppLuma::applySpeak(std::string_view text)
     if (_qgif_player) {
         _qgif_player->play("Hello.qgif", duration);
     }
-    GetStackChan().addModifier(std::make_unique<TimedSpeechModifier>(text, duration));
-    GetStackChan().addModifier(std::make_unique<SpeakingModifier>(duration, 180, false));
-
     setStatus("Speaking");
 }
 

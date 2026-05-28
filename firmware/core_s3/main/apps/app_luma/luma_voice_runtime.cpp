@@ -5,13 +5,13 @@
 
 #include <ArduinoJson.hpp>
 #include <algorithm>
-#include <audio/audio_codec.h>
-#include <board.h>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <hal/hal.h>
+#include <luma_platform/audio_codec.h>
+#include <luma_platform/board.h>
 #include <memory>
 #include <mooncake_log.h>
 #include <sdkconfig.h>
@@ -27,13 +27,16 @@
 namespace {
 
 constexpr const char* TAG = "LumaVoice";
+#if LUMA_HAS_CUSTOM_WAKE_WORD
 constexpr int kWakeWordSampleRateHz = 16000;
+#endif
 
 std::string make_session_id()
 {
     return std::string("voice_") + std::to_string(GetHAL().millis());
 }
 
+#if LUMA_HAS_CUSTOM_WAKE_WORD
 void resample_interleaved(
     const std::vector<int16_t>& input,
     int input_rate_hz,
@@ -79,6 +82,7 @@ void resample_interleaved(
         }
     }
 }
+#endif
 
 }  // namespace
 

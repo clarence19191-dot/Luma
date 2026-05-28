@@ -43,7 +43,7 @@ bool LumaQgifPlayer::init(lv_obj_t* parent, uint16_t target_width, uint16_t targ
         return false;
     }
 
-    std::memset(_framebuffer, 0xFF, framebuffer_bytes);
+    std::memset(_framebuffer, 0x00, framebuffer_bytes);
     _image_dsc.header.cf    = LV_COLOR_FORMAT_RGB565;
     _image_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
     _image_dsc.header.w     = _target_width;

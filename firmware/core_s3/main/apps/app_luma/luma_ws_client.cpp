@@ -5,11 +5,11 @@
 #include "luma_config.h"
 
 #include <ArduinoJson.hpp>
-#include <board.h>
 #include <hal/hal.h>
+#include <luma_platform/board.h>
+#include <luma_platform/net/web_socket.h>
+#include <luma_platform/settings.h>
 #include <mooncake_log.h>
-#include <settings.h>
-#include <web_socket.h>
 
 namespace {
 
@@ -77,8 +77,7 @@ void LumaWsClient::connect()
     _last_reconnect_attempt = GetHAL().millis();
     _websocket.reset();
 
-    auto& board  = Board::GetInstance();
-    auto network = board.GetNetwork();
+    auto network = Board::GetInstance().GetNetwork();
     _websocket   = network->CreateWebSocket(1);
     if (!_websocket) {
         mclog::tagError(TAG, "failed to create websocket");
@@ -87,7 +86,7 @@ void LumaWsClient::connect()
 
     _websocket->OnConnected([this]() {
         mclog::tagInfo(TAG, "connected to {}", _url);
-        sendJson("{\"type\":\"hello\",\"device_id\":\"luma-core-s3\",\"role\":\"device\",\"capabilities\":[\"display.lvgl_face\",\"display.qgif_stream\",\"audio.wake_word\",\"audio.capture_pcm\",\"audio.playback_pcm\",\"input.touch_wake\",\"safety.estop\"]}");
+        sendJson("{\"type\":\"hello\",\"device_id\":\"luma-core-s3\",\"role\":\"device\",\"capabilities\":[\"display.qgif_stream\",\"audio.capture_pcm\",\"audio.playback_pcm\",\"input.touch_wake\",\"safety.estop\"]}");
     });
 
     _websocket->OnDisconnected([]() { mclog::tagWarn(TAG, "disconnected"); });

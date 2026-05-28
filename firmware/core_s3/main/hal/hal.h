@@ -13,8 +13,8 @@
 #include <uitk/short_namespace.hpp>
 #include <smooth_lvgl.hpp>
 #include <array>
-#include <lvgl_image.h>
 #include <string_view>
+#include <vector>
 
 /**
  * @brief
@@ -246,7 +246,6 @@ public:
     uitk::Signal<WsSignalSource> onWsCallEnd;
     uitk::Signal<const WsTextMessage_t&> onWsTextMessage;
     uitk::Signal<bool> onWsVideoModeChange;
-    uitk::Signal<std::shared_ptr<LvglImage>> onWsVideoFrame;
     uitk::Signal<std::string_view> onWsDanceData;
     uitk::Signal<CommonLogLevel, std::string_view> onWsLog;
 
@@ -310,7 +309,6 @@ private:
     void servo_init();
     void head_touch_init();
     void io_expander_init();
-    void imu_init();
     void rtc_init();
 };
 

@@ -4,147 +4,186 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hal_bridge.h"
-#include "stackchan_display.h"
-#include <esp_log.h>
-#include <esp_err.h>
-#include <nvs.h>
-#include <nvs_flash.h>
-#include <driver/gpio.h>
-#include <esp_event.h>
-#include <application.h>
-#include <board.h>
-#include <display.h>
+
+#include <luma_platform/audio_codec.h>
+#include <luma_platform/board.h>
+#include <luma_platform/display.h>
+#include <luma_platform/settings.h>
+
 #include <mutex>
-#include <assets.h>
-#include <settings.h>
 
-static const char* _tag = "HAL_BRIDGE";
+namespace {
 
-static constexpr std::string_view _xiaozhi_config_nvs_ns                           = "xiaozhi";
-static constexpr std::string_view _xiaozhi_config_idle_shutdown_time_key           = "idle_sec";
-static constexpr std::string_view _xiaozhi_config_allow_shutdown_when_charging_key = "ext_pwr";
-static constexpr std::string_view _xiaozhi_config_idle_random_movement_key         = "idle_lv";
+static constexpr std::string_view kConfigNvsNs = "luma";
+static constexpr std::string_view kIdleShutdownTimeKey = "idle_sec";
+static constexpr std::string_view kAllowShutdownWhenChargingKey = "ext_pwr";
+static constexpr std::string_view kIdleRandomMovementKey = "idle_lv";
+
+std::mutex bridge_mutex;
+hal_bridge::Data_t bridge_data;
+
+Display* display()
+{
+    return Board::GetInstance().GetDisplay();
+}
+
+}  // namespace
 
 namespace hal_bridge {
 
-/* -------------------------------------------------------------------------- */
-/*                            State and touch point                           */
-/* -------------------------------------------------------------------------- */
-
-static std::mutex _mutex;
-static Data_t _data;
-
 void lock()
 {
-    _mutex.lock();
+    bridge_mutex.lock();
 }
 
 void unlock()
 {
-    _mutex.unlock();
+    bridge_mutex.unlock();
 }
 
 Data_t& get_data()
 {
-    return _data;
+    return bridge_data;
 }
 
 void set_touch_point(int num, int x, int y)
 {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _data.touchPoint.num = num;
-    _data.touchPoint.x   = x;
-    _data.touchPoint.y   = y;
+    std::lock_guard<std::mutex> lock(bridge_mutex);
+    bridge_data.touchPoint.num = num;
+    bridge_data.touchPoint.x = x;
+    bridge_data.touchPoint.y = y;
 }
 
 TouchPoint_t get_touch_point()
 {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _data.touchPoint;
+    std::lock_guard<std::mutex> lock(bridge_mutex);
+    return bridge_data.touchPoint;
 }
 
 bool is_xiaozhi_mode()
 {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _data.isXiaozhiMode;
+    return false;
 }
 
 void set_xiaozhi_mode(bool mode)
 {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _data.isXiaozhiMode = mode;
+    (void)mode;
 }
 
-/* -------------------------------------------------------------------------- */
-/*                                   Display                                  */
-/* -------------------------------------------------------------------------- */
-#define DISPLAY_TYPE StackChanAvatarDisplay
-
-lv_disp_t* display_get_lvgl_display()
+void toggle_xiaozhi_chat_state()
 {
-    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
-    return display->GetLvglDisplay();
 }
 
 void disply_lvgl_lock()
 {
-    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
-    display->LvglLock();
+    display()->Lock(30000);
 }
 
 void disply_lvgl_unlock()
 {
-    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
-    display->LvglUnlock();
+    display()->Unlock();
 }
 
-/* -------------------------------------------------------------------------- */
-/*                                 Application                                */
-/* -------------------------------------------------------------------------- */
+lv_disp_t* display_get_lvgl_display()
+{
+    return display()->GetLvglDisplay();
+}
 
 void xiaozhi_board_init()
 {
-    // Init board
-    auto& board = Board::GetInstance();
+    (void)Board::GetInstance();
 }
 
 void start_xiaozhi_app()
 {
-    set_xiaozhi_mode(true);
+}
 
-    // Initialize and run the application
-    auto& app = Application::GetInstance();
-    app.Initialize();
-    app.Run();  // This function runs the main event loop and never returns
+bool is_xiaozhi_ready()
+{
+    return true;
+}
+
+bool is_xiaozhi_idle()
+{
+    return true;
 }
 
 XiaozhiConfig_t get_xiaozhi_config()
 {
     XiaozhiConfig_t config;
-
-    Settings settings(_xiaozhi_config_nvs_ns.data(), false);
-    config.idleShutdownTimeSeconds = settings.GetInt(_xiaozhi_config_idle_shutdown_time_key.data(),
-                                                     static_cast<int>(config.idleShutdownTimeSeconds));
+    Settings settings(kConfigNvsNs.data(), false);
+    config.idleShutdownTimeSeconds =
+        settings.GetInt(kIdleShutdownTimeKey.data(), static_cast<int>(config.idleShutdownTimeSeconds));
     config.allowShutdownWhenCharging =
-        settings.GetBool(_xiaozhi_config_allow_shutdown_when_charging_key.data(), config.allowShutdownWhenCharging);
+        settings.GetBool(kAllowShutdownWhenChargingKey.data(), config.allowShutdownWhenCharging);
     config.idleRandomMovementLevel =
-        settings.GetInt(_xiaozhi_config_idle_random_movement_key.data(), config.idleRandomMovementLevel);
-
+        settings.GetInt(kIdleRandomMovementKey.data(), config.idleRandomMovementLevel);
     return config;
 }
 
 void set_xiaozhi_config(const XiaozhiConfig_t& config)
 {
-    Settings settings(_xiaozhi_config_nvs_ns.data(), true);
-    settings.SetInt(_xiaozhi_config_idle_shutdown_time_key.data(), config.idleShutdownTimeSeconds);
-    settings.SetBool(_xiaozhi_config_allow_shutdown_when_charging_key.data(), config.allowShutdownWhenCharging);
-    settings.SetInt(_xiaozhi_config_idle_random_movement_key.data(), config.idleRandomMovementLevel);
+    Settings settings(kConfigNvsNs.data(), true);
+    settings.SetInt(kIdleShutdownTimeKey.data(), config.idleShutdownTimeSeconds);
+    settings.SetBool(kAllowShutdownWhenChargingKey.data(), config.allowShutdownWhenCharging);
+    settings.SetInt(kIdleRandomMovementKey.data(), config.idleRandomMovementLevel);
+}
+
+i2c_master_bus_handle_t board_get_i2c_bus()
+{
+    return Board::GetInstance().GetI2cBus();
+}
+
+int board_get_battery_level()
+{
+    int level = 0;
+    bool charging = false;
+    bool discharging = false;
+    return Board::GetInstance().GetBatteryLevel(level, charging, discharging) ? level : 100;
+}
+
+bool board_is_battery_charging()
+{
+    int level = 0;
+    bool charging = false;
+    bool discharging = false;
+    return Board::GetInstance().GetBatteryLevel(level, charging, discharging) ? charging : false;
+}
+
+void board_set_backlight_brightness(uint8_t brightness, bool permanent)
+{
+    if (auto* backlight = Board::GetInstance().GetBacklight()) {
+        backlight->SetBrightness(brightness, permanent);
+    }
+}
+
+uint8_t board_get_backlight_brightness()
+{
+    if (auto* backlight = Board::GetInstance().GetBacklight()) {
+        return backlight->brightness();
+    }
+    return 0;
+}
+
+void board_set_speaker_volume(uint8_t volume, bool permanent)
+{
+    if (auto* codec = Board::GetInstance().GetAudioCodec()) {
+        codec->SetOutputVolume(volume);
+    }
+    (void)permanent;
+}
+
+uint8_t board_get_speaker_volume()
+{
+    if (auto* codec = Board::GetInstance().GetAudioCodec()) {
+        return static_cast<uint8_t>(codec->output_volume());
+    }
+    return 0;
 }
 
 void app_play_sound(const std::string_view& sound)
 {
-    auto& app = Application::GetInstance();
-    app.PlaySound(sound);
+    (void)sound;
 }
 
 }  // namespace hal_bridge

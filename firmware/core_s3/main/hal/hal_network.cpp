@@ -4,11 +4,8 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hal.h"
-#include <stackchan/stackchan.h>
-#include <mooncake.h>
+#include <luma_platform/board.h>
 #include <mooncake_log.h>
-#include <wifi_manager.h>
-#include <board.h>
 #include <mutex>
 #include <queue>
 #include <vector>
@@ -51,12 +48,13 @@ void Hal::startNetwork(std::function<void(std::string_view)> onLog)
         return;
     }
 
+    std::atomic<bool> wait_done = false;
     std::atomic<bool> network_connected = false;
 
     auto& board = Board::GetInstance();
     mclog::tagInfo(_tag, "start and wait for network connected...");
 
-    board.SetNetworkEventCallback([&network_connected, &onLog](NetworkEvent event, const std::string& data) {
+    board.SetNetworkEventCallback([&wait_done, &network_connected, &onLog](NetworkEvent event, const std::string& data) {
         switch (event) {
             case NetworkEvent::Scanning:
                 if (onLog) {
@@ -77,60 +75,46 @@ void Hal::startNetwork(std::function<void(std::string_view)> onLog)
             }
             case NetworkEvent::Connected: {
                 network_connected = true;
+                wait_done = true;
                 break;
             }
             case NetworkEvent::Disconnected:
                 break;
             case NetworkEvent::WifiConfigModeEnter: {
-                auto& wifi_manager = WifiManager::GetInstance();
-                auto msg = fmt::format("Enter WiFi config mode. Hotspot: {}, Config URL: {}", wifi_manager.GetApSsid(),
-                                       wifi_manager.GetApWebUrl());
                 if (onLog) {
-                    onLog(msg);
+                    onLog("WiFi credentials required");
                 }
+                wait_done = true;
                 break;
             }
             case NetworkEvent::WifiConfigModeExit:
-                // WiFi config mode exit is handled by WifiBoard internally
-                break;
-            // Cellular modem specific events
-            case NetworkEvent::ModemDetecting:
-                break;
-            case NetworkEvent::ModemErrorNoSim:
-                break;
-            case NetworkEvent::ModemErrorRegDenied:
-                break;
-            case NetworkEvent::ModemErrorInitFailed:
-                break;
-            case NetworkEvent::ModemErrorTimeout:
                 break;
         }
     });
     board.StartNetwork();
 
-    while (!network_connected) {
+    while (!wait_done) {
         GetHAL().delay(500);
     }
-    mclog::tagInfo(_tag, "network connected");
     board.SetNetworkEventCallback(nullptr);
 
-    startSntp();
+    if (network_connected) {
+        mclog::tagInfo(_tag, "network connected");
+        startSntp();
+    }
 
-    _is_network_connected = true;
+    _is_network_connected = network_connected;
 }
 
 WifiStatus Hal::getWifiStatus()
 {
-    auto& wifi = WifiManager::GetInstance();
+    auto* network = Board::GetInstance().GetNetwork();
 
-    if (wifi.IsConfigMode()) {
-        return WifiStatus::None;
-    }
-    if (!wifi.IsConnected()) {
+    if (network->IsConfigMode() || !network->IsConnected()) {
         return WifiStatus::None;
     }
 
-    int rssi = wifi.GetRssi();
+    int rssi = network->GetRssi();
     if (rssi >= -65) {
         return WifiStatus::High;
     } else if (rssi >= -75) {
