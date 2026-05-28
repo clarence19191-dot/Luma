@@ -10,20 +10,33 @@ from typing import Any
 from uuid import uuid4
 
 
-ALLOWED_MEMORY_TYPES = {
-    "user_profile",
+ALLOWED_MEMORY_CATEGORIES = {
     "preference",
-    "dislike",
-    "pet",
-    "life_habit",
-    "interaction",
-    "emotional_care",
+    "habit",
+    "event",
+    "emotional_pattern",
+    "behavior_routine",
+    "relationship",
 }
 
+LEGACY_MEMORY_CATEGORY_MAP = {
+    "user_profile": "relationship",
+    "preference": "preference",
+    "dislike": "preference",
+    "pet": "relationship",
+    "life_habit": "habit",
+    "interaction": "behavior_routine",
+    "emotional_care": "emotional_pattern",
+    "one_off": "event",
+    "task": "event",
+    "work_detail": "event",
+}
+
+ALLOWED_MEMORY_TYPES = set(LEGACY_MEMORY_CATEGORY_MAP) | ALLOWED_MEMORY_CATEGORIES
+ALLOWED_MEMORY_HORIZONS = {"short_term", "long_term"}
+SHORT_TERM_MEMORY_TTL_DAYS = 7
+
 REJECTED_MEMORY_TYPES = {
-    "one_off",
-    "task",
-    "work_detail",
     "knowledge",
     "credential",
     "sensitive",
@@ -125,7 +138,9 @@ class MemoryStore:
                 )
                 """
             )
+            self._ensure_memory_columns()
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status, updated_at)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category, horizon, updated_at)")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conversation_boundaries (
@@ -143,6 +158,39 @@ class MemoryStore:
             )
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_boundaries_ts ON conversation_boundaries(ts)")
             self._conn.commit()
+
+    def _ensure_memory_columns(self) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        migrations = {
+            "category": "ALTER TABLE memories ADD COLUMN category TEXT NOT NULL DEFAULT ''",
+            "horizon": "ALTER TABLE memories ADD COLUMN horizon TEXT NOT NULL DEFAULT 'long_term'",
+            "importance": "ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5",
+            "last_seen_at": "ALTER TABLE memories ADD COLUMN last_seen_at REAL",
+            "expires_at": "ALTER TABLE memories ADD COLUMN expires_at REAL",
+            "evidence": "ALTER TABLE memories ADD COLUMN evidence TEXT NOT NULL DEFAULT '[]'",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                self._conn.execute(statement)
+        self._conn.execute(
+            """
+            UPDATE memories
+            SET category = CASE type
+                WHEN 'user_profile' THEN 'relationship'
+                WHEN 'dislike' THEN 'preference'
+                WHEN 'pet' THEN 'relationship'
+                WHEN 'life_habit' THEN 'habit'
+                WHEN 'interaction' THEN 'behavior_routine'
+                WHEN 'emotional_care' THEN 'emotional_pattern'
+                WHEN 'one_off' THEN 'event'
+                WHEN 'task' THEN 'event'
+                WHEN 'work_detail' THEN 'event'
+                ELSE type
+            END
+            WHERE category = ''
+            """
+        )
+        self._conn.execute("UPDATE memories SET last_seen_at = updated_at WHERE last_seen_at IS NULL")
 
     def log(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         event = {"ts": time.time(), "kind": kind, "payload": payload}
@@ -408,16 +456,25 @@ class MemoryStore:
         source_turn_id: int | None,
         min_confidence: float = 0.68,
     ) -> dict[str, Any] | None:
-        memory_type = str(_field(candidate, "type", "")).strip()
+        raw_type = str(_field(candidate, "type", "")).strip()
+        category = _memory_category(candidate)
+        horizon = _memory_horizon(candidate, category)
         content = _normalize_content(str(_field(candidate, "content", "")).strip())
+        evidence = _normalize_content(str(_field(candidate, "evidence", "")).strip())
         try:
             confidence = float(_field(candidate, "confidence", 0.0))
         except (TypeError, ValueError):
             confidence = 0.0
+        try:
+            importance = float(_field(candidate, "importance", confidence))
+        except (TypeError, ValueError):
+            importance = confidence
+        confidence = _clamp(confidence, 0.0, 1.0)
+        importance = _clamp(importance, 0.0, 1.0)
 
-        if not content or len(content) > 160:
+        if not content or len(content) > 220:
             return None
-        if memory_type in REJECTED_MEMORY_TYPES or memory_type not in ALLOWED_MEMORY_TYPES:
+        if raw_type in REJECTED_MEMORY_TYPES or category not in ALLOWED_MEMORY_CATEGORIES:
             return None
         if confidence < min_confidence:
             return None
@@ -425,48 +482,93 @@ class MemoryStore:
             return None
 
         now = time.time()
-        normalized = _dedupe_key(content)
+        memory_type = raw_type if raw_type in ALLOWED_MEMORY_TYPES else category
+        expires_at = _memory_expires_at(candidate, horizon, now)
+        evidence_json = _merge_evidence("[]", evidence)
         with self._lock:
-            existing = self._conn.execute(
+            candidates = self._conn.execute(
                 """
-                SELECT id FROM memories
-                WHERE status = 'active' AND lower(content) = lower(?)
-                LIMIT 1
+                SELECT id, content, confidence, importance, expires_at, evidence, horizon
+                FROM memories
+                WHERE status = 'active'
+                  AND category = ?
+                  AND (expires_at IS NULL OR expires_at > ?)
+                ORDER BY updated_at DESC, id DESC
                 """,
-                (normalized,),
-            ).fetchone()
+                (category, now),
+            ).fetchall()
+            existing = next((row for row in candidates if _memory_is_duplicate(content, str(row[1]))), None)
             if existing:
+                memory_id = int(existing[0])
+                existing_expires_at = existing[4]
+                existing_horizon = str(existing[6] or "long_term")
+                merged_horizon = "long_term" if existing_horizon == "long_term" or horizon == "long_term" else "short_term"
+                merged_expires_at = None if merged_horizon == "long_term" else _max_optional_timestamp(existing_expires_at, expires_at)
+                merged_evidence = _merge_evidence(str(existing[5] or "[]"), evidence)
                 self._conn.execute(
-                    "UPDATE memories SET updated_at = ?, confidence = max(confidence, ?) WHERE id = ?",
-                    (now, confidence, existing[0]),
+                    """
+                    UPDATE memories
+                    SET updated_at = ?,
+                        last_seen_at = ?,
+                        confidence = max(confidence, ?),
+                        importance = max(importance, ?),
+                        horizon = ?,
+                        expires_at = ?,
+                        evidence = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, confidence, importance, merged_horizon, merged_expires_at, merged_evidence, memory_id),
                 )
                 self._conn.commit()
-                return self.get_memory(int(existing[0]))
-            cursor = self._conn.execute(
-                """
-                INSERT INTO memories(
-                    created_at, updated_at, type, content, confidence, source_conversation_id, source_turn_id, status
+            else:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO memories(
+                        created_at, updated_at, type, category, horizon, content, confidence, importance,
+                        last_seen_at, expires_at, evidence, source_conversation_id, source_turn_id, status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                    """,
+                    (
+                        now,
+                        now,
+                        memory_type,
+                        category,
+                        horizon,
+                        content,
+                        confidence,
+                        importance,
+                        now,
+                        expires_at,
+                        evidence_json,
+                        source_conversation_id,
+                        source_turn_id,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
-                """,
-                (now, now, memory_type, content, confidence, source_conversation_id, source_turn_id),
-            )
-            self._conn.commit()
-            memory_id = int(cursor.lastrowid)
+                self._conn.commit()
+                memory_id = int(cursor.lastrowid)
         return self.get_memory(memory_id)
 
     def list_memories(self, *, active_only: bool = True, limit: int = 100) -> list[dict[str, Any]]:
-        where = "WHERE status = 'active'" if active_only else ""
+        params: tuple[Any, ...]
+        if active_only:
+            where = "WHERE status = 'active' AND (expires_at IS NULL OR expires_at > ?)"
+            params = (time.time(), limit)
+        else:
+            where = ""
+            params = (limit,)
         with self._lock:
             rows = self._conn.execute(
                 f"""
-                SELECT id, created_at, updated_at, type, content, confidence, source_conversation_id, source_turn_id, status, deleted_at
+                SELECT id, created_at, updated_at, type, content, confidence,
+                       source_conversation_id, source_turn_id, status, deleted_at,
+                       category, horizon, importance, last_seen_at, expires_at, evidence
                 FROM memories
                 {where}
                 ORDER BY updated_at DESC, id DESC
                 LIMIT ?
                 """,
-                (limit,),
+                params,
             ).fetchall()
         return [self._memory_from_row(row) for row in rows]
 
@@ -479,16 +581,27 @@ class MemoryStore:
         for memory in memories:
             content_chars = _content_chars(memory["content"])
             overlap = len(text_chars & content_chars)
-            score = overlap + float(memory["confidence"]) + (0.5 if memory["type"] in {"preference", "dislike", "interaction"} else 0)
+            category = memory.get("category") or memory.get("type")
+            stable_bonus = 0.8 if category in {"preference", "relationship", "behavior_routine", "emotional_pattern"} else 0.0
+            short_term_penalty = 0.2 if memory.get("horizon") == "short_term" else 0.0
+            score = (
+                overlap
+                + float(memory["confidence"])
+                + float(memory.get("importance", 0.5))
+                + stable_bonus
+                - short_term_penalty
+            )
             scored.append((score, memory))
         scored.sort(key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
-        return [memory for score, memory in scored[:limit] if score > 0]
+        return [memory for score, memory in scored[:limit] if score > 0.25]
 
     def get_memory(self, memory_id: int) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT id, created_at, updated_at, type, content, confidence, source_conversation_id, source_turn_id, status, deleted_at
+                SELECT id, created_at, updated_at, type, content, confidence,
+                       source_conversation_id, source_turn_id, status, deleted_at,
+                       category, horizon, importance, last_seen_at, expires_at, evidence
                 FROM memories
                 WHERE id = ?
                 """,
@@ -516,7 +629,10 @@ class MemoryStore:
             return 0
         now = time.time()
         with self._lock:
-            rows = self._conn.execute("SELECT id, content FROM memories WHERE status = 'active'").fetchall()
+            rows = self._conn.execute(
+                "SELECT id, content FROM memories WHERE status = 'active' AND (expires_at IS NULL OR expires_at > ?)",
+                (now,),
+            ).fetchall()
             memory_ids: list[int] = []
             for row in rows:
                 content = str(row[1]).lower()
@@ -579,6 +695,12 @@ class MemoryStore:
             "source_turn_id": row[7],
             "status": row[8],
             "deleted_at": row[9],
+            "category": row[10],
+            "horizon": row[11],
+            "importance": row[12],
+            "last_seen_at": row[13],
+            "expires_at": row[14],
+            "evidence": json.loads(row[15] or "[]"),
         }
 
     @staticmethod
@@ -615,6 +737,77 @@ def _field(value: dict[str, Any] | Any, name: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _memory_category(candidate: dict[str, Any] | Any) -> str:
+    raw = str(_field(candidate, "category", "") or _field(candidate, "type", "")).strip()
+    return LEGACY_MEMORY_CATEGORY_MAP.get(raw, raw)
+
+
+def _memory_horizon(candidate: dict[str, Any] | Any, category: str) -> str:
+    raw = str(_field(candidate, "horizon", "")).strip()
+    if raw in ALLOWED_MEMORY_HORIZONS:
+        return raw
+    return "short_term" if category == "event" else "long_term"
+
+
+def _memory_expires_at(candidate: dict[str, Any] | Any, horizon: str, now: float) -> float | None:
+    raw_expires_at = _field(candidate, "expires_at", None)
+    if raw_expires_at is not None:
+        try:
+            parsed = float(raw_expires_at)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        if parsed > now:
+            return parsed
+    if horizon != "short_term":
+        return None
+    raw_ttl = _field(candidate, "ttl_days", None)
+    try:
+        ttl_days = int(raw_ttl) if raw_ttl is not None else SHORT_TERM_MEMORY_TTL_DAYS
+    except (TypeError, ValueError):
+        ttl_days = SHORT_TERM_MEMORY_TTL_DAYS
+    ttl_days = max(1, min(ttl_days, 90))
+    return now + ttl_days * 86400
+
+
+def _memory_is_duplicate(left: str, right: str) -> bool:
+    if _dedupe_key(left) == _dedupe_key(right):
+        return True
+    left_chars = _content_chars(left)
+    right_chars = _content_chars(right)
+    if not left_chars or not right_chars:
+        return False
+    overlap = len(left_chars & right_chars)
+    return overlap / max(1, min(len(left_chars), len(right_chars))) >= 0.72
+
+
+def _merge_evidence(existing: str, new_evidence: str) -> str:
+    try:
+        parsed = json.loads(existing or "[]")
+    except json.JSONDecodeError:
+        parsed = []
+    items = [str(item).strip() for item in parsed if str(item).strip()] if isinstance(parsed, list) else []
+    if new_evidence and new_evidence not in items:
+        items.append(new_evidence)
+    return json.dumps(items[-5:], ensure_ascii=False)
+
+
+def _max_optional_timestamp(left: Any, right: Any) -> float | None:
+    values: list[float] = []
+    for value in (left, right):
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        values.append(parsed)
+    return max(values) if values else None
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
 
 
 def _normalize_content(content: str) -> str:

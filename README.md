@@ -2,35 +2,33 @@
 
 Chinese README: [README.zh-CN.md](README.zh-CN.md)
 
-Project Luma V0 is a voice-loop CoreS3 robot terminal:
+Project Luma is a CoreS3-based desktop pet prototype. The system is split into:
 
-- CoreS3 Head: expression display, wake/touch trigger, microphone PCM capture, speaker PCM playback, and device safety.
-- Luma Brain: Python FastAPI, WebSocket, SQLite logs, voice session runtime, desktop-pet personality, conversation boundary, relationship memory, local STT/TTS, OpenAI-compatible LLM provider, and web console.
-- Browser simulator: development-only head device connected to the same `/ws/head` endpoint.
+- **Brain**: a Python FastAPI service that runs the voice loop, WebSocket protocol, LLM decision layer, memory store, local STT/TTS adapters, and web console.
+- **CoreS3 head**: firmware for expression playback, touch wake, microphone upload, speaker playback, and device-side safety handling.
+- **Browser simulator**: a development head simulator connected to the same `/ws/head` endpoint.
 
-During development the Mac runs Brain. The same Brain process is designed to move to Raspberry Pi later without changing the CoreS3 wire protocol.
-
-## Run The Brain
+## Quick Start
 
 ```bash
 python3 -m pip install -r requirements.txt
 python3 -m luma.brain
 ```
 
-Open `http://127.0.0.1:8787`. The page starts a browser simulator automatically.
+Open `http://127.0.0.1:8787` to use the web console and browser simulator.
 
-STT and TTS are local by default. `OPENAI_API_KEY` is no longer required for the voice loop. The LLM layer is still OpenAI-compatible and can point to OpenAI, DeepSeek, or another compatible endpoint.
+Brain loads `.env.local` and `.env` from the working directory. `.env.local` is ignored by git.
 
 Example `.env.local`:
 
 ```text
 LUMA_STT_PROVIDER=local_sherpa
 LUMA_TTS_PROVIDER=local_sherpa
-LUMA_SHERPA_ROOT=/Users/winmer/files/Starest/Project Luma/models/sherpa
+LUMA_SHERPA_ROOT=./models/sherpa
 
-LUMA_SHERPA_TTS_MODEL_DIR=/Users/winmer/files/Starest/Project Luma/models/sherpa/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia
-LUMA_SHERPA_TTS_VOCODER=/Users/winmer/files/Starest/Project Luma/models/sherpa/vocos_24khz.onnx
-LUMA_TTS_REFERENCE_AUDIO=/Users/winmer/files/Starest/Project Luma/models/sherpa/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia/test_wavs/leijun-1.wav
+LUMA_SHERPA_TTS_MODEL_DIR=./models/sherpa/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia
+LUMA_SHERPA_TTS_VOCODER=./models/sherpa/vocos_24khz.onnx
+LUMA_TTS_REFERENCE_AUDIO=./models/sherpa/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia/test_wavs/leijun-1.wav
 LUMA_TTS_REFERENCE_TEXT=reference voice text
 
 LUMA_LLM_BASE_URL=https://api.openai.com/v1
@@ -43,19 +41,11 @@ LUMA_VOICE_CHUNK_MS=40
 LUMA_VOICE_MAX_RECORD_SECONDS=8
 ```
 
-Local `.env.local` is loaded automatically by Brain and is ignored by git.
+## Local Speech
 
-## Local Speech Models
+Local STT uses `sherpa-onnx`; local TTS uses `sherpa-onnx-offline-tts`. The runtime does not download model files automatically and does not silently fall back to cloud speech providers.
 
-Brain uses `sherpa-onnx` for local STT and `sherpa-onnx-offline-tts` for local TTS. It never downloads models at runtime and never falls back to cloud STT/TTS silently.
-
-The local model/runtime directory is ignored by git. Put or copy speech assets under:
-
-```text
-/Users/winmer/files/Starest/Project Luma/models/sherpa
-```
-
-Expected runtime and ASR files:
+Expected ASR/runtime layout:
 
 ```text
 models/sherpa/
@@ -67,9 +57,7 @@ models/sherpa/
     decoder.int8.onnx
 ```
 
-TTS defaults to ZipVoice zh/en. Place model assets outside git, for example under ignored `models/`, and configure `LUMA_SHERPA_TTS_MODEL_DIR`.
-
-Expected ZipVoice files:
+Expected ZipVoice TTS layout:
 
 ```text
 models/sherpa/
@@ -83,35 +71,22 @@ models/sherpa/
   vocos_24khz.onnx
 ```
 
-`LUMA_SHERPA_TTS_VOCODER`, `LUMA_TTS_REFERENCE_AUDIO`, and `LUMA_TTS_REFERENCE_TEXT` must point to the vocoder and reference voice assets. Generated WAV audio is converted to the CoreS3 playback format: 24 kHz, mono, PCM16.
+Generated TTS audio is converted to the CoreS3 playback format: 24 kHz, mono, PCM16.
 
-To explicitly use the old cloud providers for debugging, set:
+## Brain Behavior
 
-```text
-LUMA_STT_PROVIDER=openai
-LUMA_TTS_PROVIDER=openai
-OPENAI_API_KEY=...
-```
+The realtime LLM decision is constrained to two outputs:
 
-## Desktop Pet Brain
+- spoken reply text,
+- Luma expression emotion.
 
-The LLM layer is intentionally constrained as a desktop pet. It outputs validated JSON with:
+The expression is Luma's display state, not the user's emotion. The LLM chooses only the emotion name from the available expression catalog; playback duration is calculated by Brain from the local qgif/gif asset.
 
-- short spoken reply text,
-- tone,
-- expression emotion,
-- pet behavior tag,
-- note-only action intent,
-- cautious relationship memory candidates,
-- safety/boundary metadata.
-
-Brain decides whether an utterance continues the same conversation, resumes a recent one, or starts a new one. Long-gap wakeups default to a fresh "re-met" interaction instead of forcing old task context.
-
-Relationship memories are SQLite rows, not a knowledge base. They are for stable preferences, disliked interaction styles, names, pets, habits, and emotional care cues. One-off tasks, work details, credentials, sensitive data, and generic knowledge are rejected.
+Memory reflection runs as a separate asynchronous LLM call after the reply is recorded. Memory rows are categorized as preferences, habits, short-term events, emotional patterns, behavior routines, or relationship context. Short-term memories can expire; long-term memories are reserved for stable interaction value. Credentials, sensitive data, and generic knowledge are rejected.
 
 ## Voice Protocol
 
-`/ws/head?device_id=luma-core-s3&role=device` carries JSON control messages plus binary PCM frames.
+`/ws/head?device_id=luma-core-s3&role=device` carries JSON control messages and binary PCM frames.
 
 CoreS3 to Brain:
 
@@ -134,7 +109,7 @@ Brain to CoreS3:
 {"type":"play_audio_begin","sample_rate_hz":24000,"channels":1,"encoding":"pcm_s16le","bytes":12345}
 ```
 
-Binary frames after `play_audio_begin` are PCM reply audio for the CoreS3 speaker. Brain closes playback with:
+Binary frames after `play_audio_begin` are PCM reply audio. Brain closes playback with:
 
 ```json
 {"type":"play_audio_end"}
@@ -156,24 +131,21 @@ curl http://127.0.0.1:8787/api/memories
 curl http://127.0.0.1:8787/api/debug/prompt
 ```
 
-The old `/api/command` path remains for expression, stop, and compatibility commands. `move_head` is intentionally disabled in this V0 because the servos are not connected.
+`/api/command` is available for expression, stop, and compatibility commands. `move_head` is disabled in this build because the servos are not connected.
 
 ## Firmware
 
-Luma's CoreS3 firmware code lives under `firmware/core_s3/`. `StackChan/` is kept only as a local reference checkout and is ignored by git.
+CoreS3 firmware lives under `firmware/core_s3/`.
 
-Current V0 firmware behavior:
+Firmware capabilities:
 
-- Text and binary WebSocket client to `/ws/head`.
-- LVGL face expression display.
-- Runtime-streamed qgif expression playback with 320x240 contain scaling.
-- Touch fallback wake trigger.
+- WebSocket client for `/ws/head`.
+- LVGL expression display.
+- Runtime qgif expression streaming with 320x240 contain scaling.
+- Touch wake trigger.
 - 24 kHz PCM16 mono microphone upload in 40 ms chunks.
 - 24 kHz PCM16 mono speaker playback from Brain.
-- Expanded semantic expression catalog with qgif asset metadata.
-- No Servo2/PCA9685 initialization in this build.
-
-Brain streams the requested qgif asset on demand. CoreS3 keeps only the current streamed qgif in RAM, scales each 1-bit frame into a 320x240 RGB565 buffer, and presents it through LVGL. If no streamed qgif is available, firmware falls back to the LVGL StackChan face.
+- Semantic expression catalog with qgif asset metadata.
 
 Default Brain URL:
 

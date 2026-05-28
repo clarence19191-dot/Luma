@@ -255,9 +255,12 @@ function renderMemories(memories) {
     const item = document.createElement("div");
     item.className = "memory-item";
     const text = document.createElement("div");
-    text.innerHTML = `<strong></strong><span></span>`;
-    text.querySelector("strong").textContent = memory.type;
+    text.innerHTML = `<strong></strong><span></span><small></small>`;
+    const expires = memory.expires_at ? `expires ${new Date(memory.expires_at * 1000).toLocaleDateString()}` : "no expiry";
+    const importance = Number(memory.importance ?? 0).toFixed(2);
+    text.querySelector("strong").textContent = memory.category || memory.type;
     text.querySelector("span").textContent = memory.content;
+    text.querySelector("small").textContent = `${memory.horizon || "long_term"} / importance ${importance} / ${expires}`;
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = "Delete";

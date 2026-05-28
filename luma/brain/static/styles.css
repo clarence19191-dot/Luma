@@ -386,6 +386,13 @@ pre {
   margin-bottom: 4px;
 }
 
+.memory-item small {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
 .voice-chip {
   display: grid;
   align-items: center;

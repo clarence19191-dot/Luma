@@ -194,6 +194,7 @@ class LumaRuntime:
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self.conversation.shutdown()
         self.memory.close()
 
     async def enqueue(self, commands: list[dict[str, Any]]) -> list[str]:
@@ -540,6 +541,7 @@ def create_app() -> FastAPI:
     async def get_debug_prompt() -> dict[str, Any]:
         return {
             "messages": runtime.conversation.last_prompt_messages,
+            "memory_messages": runtime.conversation.last_memory_prompt_messages,
             "boundary": runtime.conversation.last_boundary.to_dict() if runtime.conversation.last_boundary else None,
         }
 

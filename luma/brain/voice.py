@@ -16,7 +16,7 @@ from uuid import uuid4
 from .config import settings
 from .conversation import ConversationManager
 from .local_audio import AudioConversionError, read_wav_as_pcm16_mono, write_pcm16_wav
-from .llm import LumaLLMDecision, parse_llm_decision
+from .llm import LumaLLMDecision, MemoryReflectionDecision, parse_llm_decision, parse_memory_reflection
 from .memory import MemoryStore
 from .state import LumaState
 
@@ -109,6 +109,14 @@ class OpenAISTTProvider(OpenAIProviderBase):
 
 class OpenAILLMProvider(OpenAIProviderBase):
     async def decide(self, messages: list[dict[str, str]]) -> LumaLLMDecision:
+        content = await self._chat_completion_content(messages)
+        return parse_llm_decision(content or "", fallback_on_error=True)
+
+    async def reflect_memory(self, messages: list[dict[str, str]]) -> MemoryReflectionDecision:
+        content = await self._chat_completion_content(messages)
+        return parse_memory_reflection(content or "", fallback_on_error=True)
+
+    async def _chat_completion_content(self, messages: list[dict[str, str]]) -> str:
         client = self._client(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
@@ -129,8 +137,7 @@ class OpenAILLMProvider(OpenAIProviderBase):
         except Exception as exc:  # pragma: no cover - exercised with live provider
             raise ProviderError("llm_failed", str(exc), retryable=True) from exc
 
-        content = result.choices[0].message.content if result.choices else ""
-        return parse_llm_decision(content or "", fallback_on_error=True)
+        return str(result.choices[0].message.content if result.choices else "")
 
 
 class OpenAITTSProvider(OpenAIProviderBase):
@@ -718,8 +725,8 @@ class VoiceSessionRuntime:
                 session_id=session_id,
                 reply=reply,
                 conversation_id=result.conversation["id"],
-                tone=decision.reply.tone,
-                pet_behavior=decision.pet_behavior,
+                tone="",
+                pet_behavior="",
                 boundary=result.boundary.to_dict(),
                 memory_count=len(result.saved_memories),
             )
@@ -737,8 +744,8 @@ class VoiceSessionRuntime:
                     "conversation_id": result.conversation["id"],
                     "turn_id": result.turn_id,
                     "text": reply,
-                    "tone": decision.reply.tone,
-                    "pet_behavior": decision.pet_behavior,
+                    "tone": "",
+                    "pet_behavior": "",
                     "emotion": decision.expression.emotion,
                     "latency_seconds": time.time() - started,
                 },
@@ -755,8 +762,8 @@ class VoiceSessionRuntime:
                 reply=reply,
                 audio_bytes=len(pcm),
                 conversation_id=result.conversation["id"],
-                tone=decision.reply.tone,
-                pet_behavior=decision.pet_behavior,
+                tone="",
+                pet_behavior="",
                 boundary=result.boundary.to_dict(),
                 memory_count=len(result.saved_memories),
             )

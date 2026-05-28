@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from dataclasses import dataclass, field
@@ -7,13 +8,18 @@ from typing import Any, Protocol
 
 from .config import settings
 from .emotions import ALLOWED_EMOTIONS
-from .llm import LumaLLMDecision, decision_to_dict
+from .llm import LumaLLMDecision, MemoryReflectionDecision, decision_to_dict
 from .memory import MemoryStore
-from .prompt import build_luma_messages
+from .prompt import build_luma_messages, build_memory_reflection_messages
 
 
 class LLMDecisionProvider(Protocol):
     async def decide(self, messages: list[dict[str, str]]) -> LumaLLMDecision:
+        ...
+
+
+class MemoryReflectionProvider(Protocol):
+    async def reflect_memory(self, messages: list[dict[str, str]]) -> MemoryReflectionDecision:
         ...
 
 
@@ -43,17 +49,28 @@ class ConversationTurnResult:
     boundary: BoundaryDecision
     decision: LumaLLMDecision
     turn_id: int
-    saved_memories: list[dict[str, Any]]
+    saved_memories: list[dict[str, Any]] = field(default_factory=list)
     deleted_memory_count: int = 0
+    memory_reflection_scheduled: bool = False
 
 
 class ConversationManager:
-    def __init__(self, memory: MemoryStore, llm_provider: LLMDecisionProvider) -> None:
+    def __init__(
+        self,
+        memory: MemoryStore,
+        llm_provider: LLMDecisionProvider,
+        memory_provider: MemoryReflectionProvider | None = None,
+    ) -> None:
         self.memory = memory
         self.llm_provider = llm_provider
+        self.memory_provider = memory_provider or (
+            llm_provider if hasattr(llm_provider, "reflect_memory") else None
+        )
         self.last_prompt_messages: list[dict[str, str]] = []
+        self.last_memory_prompt_messages: list[dict[str, str]] = []
         self.last_boundary: BoundaryDecision | None = None
         self.last_result: ConversationTurnResult | None = None
+        self._memory_tasks: set[asyncio.Task[Any]] = set()
 
     async def process_user_turn(
         self,
@@ -94,21 +111,20 @@ class ConversationManager:
             luma_text=decision.reply.text,
             decision=decision_dict,
             emotion=decision.expression.emotion,
-            tone=decision.reply.tone,
-            pet_behavior=decision.pet_behavior,
+            tone="",
+            pet_behavior="",
             now=ts,
         )
 
-        saved_memories: list[dict[str, Any]] = []
-        if allow_memory_write:
-            for candidate in decision.memory_candidates:
-                saved = self.memory.save_memory_candidate(
-                    candidate,
-                    source_conversation_id=conversation["id"],
-                    source_turn_id=turn_id,
-                )
-                if saved:
-                    saved_memories.append(saved)
+        memory_reflection_scheduled = False
+        if allow_memory_write and self.memory_provider is not None:
+            self._schedule_memory_reflection(
+                user_text=text,
+                luma_text=decision.reply.text,
+                conversation_id=conversation["id"],
+                turn_id=turn_id,
+            )
+            memory_reflection_scheduled = True
 
         updated = self.memory.get_conversation(conversation["id"]) or conversation
         result = ConversationTurnResult(
@@ -116,8 +132,8 @@ class ConversationManager:
             boundary=boundary,
             decision=decision,
             turn_id=turn_id,
-            saved_memories=saved_memories,
             deleted_memory_count=deleted_count,
+            memory_reflection_scheduled=memory_reflection_scheduled,
         )
         self.last_result = result
         self.memory.log(
@@ -128,14 +144,101 @@ class ConversationManager:
                 "source": source,
                 "boundary": boundary.to_dict(),
                 "reply": decision.reply.text,
-                "tone": decision.reply.tone,
-                "pet_behavior": decision.pet_behavior,
+                "tone": "",
+                "pet_behavior": "",
                 "emotion": decision.expression.emotion,
-                "saved_memory_count": len(saved_memories),
+                "memory_reflection_scheduled": memory_reflection_scheduled,
                 "deleted_memory_count": deleted_count,
             },
         )
         return result
+
+    def _schedule_memory_reflection(
+        self,
+        *,
+        user_text: str,
+        luma_text: str,
+        conversation_id: str,
+        turn_id: int,
+    ) -> None:
+        task = asyncio.create_task(
+            self._run_memory_reflection(
+                user_text=user_text,
+                luma_text=luma_text,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            ),
+            name=f"luma-memory-{turn_id}",
+        )
+        self._memory_tasks.add(task)
+        task.add_done_callback(self._memory_tasks.discard)
+
+    async def _run_memory_reflection(
+        self,
+        *,
+        user_text: str,
+        luma_text: str,
+        conversation_id: str,
+        turn_id: int,
+    ) -> None:
+        if self.memory_provider is None:
+            return
+        self.memory.log("memory_reflection_started", {"conversation_id": conversation_id, "turn_id": turn_id})
+        try:
+            conversation = self.memory.get_conversation(conversation_id)
+            if conversation is None:
+                return
+            recent_turns = self.memory.recent_turns(conversation_id, limit=settings.conversation_recent_turns)
+            memories = self.memory.relevant_memories(user_text, limit=settings.conversation_memory_limit)
+            messages = build_memory_reflection_messages(
+                user_text=user_text,
+                luma_text=luma_text,
+                conversation=conversation,
+                recent_turns=recent_turns,
+                memories=memories,
+            )
+            self.last_memory_prompt_messages = messages
+            reflection = await self.memory_provider.reflect_memory(messages)
+            saved_memories: list[dict[str, Any]] = []
+            ignored = 0
+            for item in reflection.memories[:3]:
+                if item.operation != "upsert":
+                    ignored += 1
+                    continue
+                saved = self.memory.save_memory_candidate(
+                    item,
+                    source_conversation_id=conversation_id,
+                    source_turn_id=turn_id,
+                )
+                if saved:
+                    saved_memories.append(saved)
+                else:
+                    ignored += 1
+            self.memory.log(
+                "memory_reflection_done",
+                {
+                    "conversation_id": conversation_id,
+                    "turn_id": turn_id,
+                    "saved_memory_count": len(saved_memories),
+                    "ignored_count": ignored,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive background guard
+            self.memory.log(
+                "memory_reflection_error",
+                {"conversation_id": conversation_id, "turn_id": turn_id, "error": str(exc)},
+            )
+
+    async def wait_for_memory_tasks(self) -> None:
+        if self._memory_tasks:
+            await asyncio.gather(*list(self._memory_tasks), return_exceptions=True)
+
+    async def shutdown(self) -> None:
+        for task in list(self._memory_tasks):
+            task.cancel()
+        if self._memory_tasks:
+            await asyncio.gather(*list(self._memory_tasks), return_exceptions=True)
+        self._memory_tasks.clear()
 
     def resolve_conversation(self, text: str, *, device_id: str, now: float | None = None) -> tuple[BoundaryDecision, dict[str, Any]]:
         ts = now or time.time()
