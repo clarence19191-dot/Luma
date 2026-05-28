@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ BASE_EMOTION_PRESETS: list[dict[str, Any]] = [
 ]
 
 GIF_DIR = Path(__file__).parents[2] / "gif"
+DEFAULT_EMOTION_DURATION_MS = 3000
 
 
 def _label_from_stem(stem: str) -> str:
@@ -54,6 +56,56 @@ def _group_from_stem(stem: str) -> str:
     return "extra"
 
 
+@lru_cache(maxsize=None)
+def _duration_for_asset(asset: str) -> int:
+    path = GIF_DIR / asset
+    if path.suffix == ".qgif":
+        gif_path = path.with_suffix(".gif")
+        if gif_path.exists():
+            duration = _duration_from_gif(gif_path)
+            if duration > 0:
+                return duration
+        if path.exists():
+            duration = _duration_from_qgif(path)
+            if duration > 0:
+                return duration
+    elif path.suffix == ".gif" and path.exists():
+        duration = _duration_from_gif(path)
+        if duration > 0:
+            return duration
+    return DEFAULT_EMOTION_DURATION_MS
+
+
+def _duration_from_gif(path: Path) -> int:
+    try:
+        from PIL import Image, ImageSequence
+
+        with Image.open(path) as image:
+            total = 0
+            for frame in ImageSequence.Iterator(image):
+                total += int(frame.info.get("duration") or image.info.get("duration") or 100)
+            return total
+    except Exception:
+        return 0
+
+
+def _duration_from_qgif(path: Path) -> int:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return 0
+    if len(data) < 5:
+        return 0
+    frame_count = data[0]
+    if frame_count == 0 or len(data) < 5 + frame_count * 2:
+        return 0
+    total = 0
+    for index in range(frame_count):
+        offset = 5 + index * 2
+        total += data[offset] | (data[offset + 1] << 8)
+    return total
+
+
 def emotion_catalog() -> list[dict[str, Any]]:
     presets = [dict(item) for item in BASE_EMOTION_PRESETS]
     known_assets = {item["asset"] for item in presets}
@@ -70,6 +122,8 @@ def emotion_catalog() -> list[dict[str, Any]]:
                     "group": _group_from_stem(path.stem),
                 }
             )
+    for preset in presets:
+        preset["duration_ms"] = _duration_for_asset(str(preset["asset"]))
     return presets
 
 
@@ -92,3 +146,10 @@ def qgif_path_for_emotion(emotion: str) -> Path | None:
     if path.exists() and path.suffix == ".qgif":
         return path
     return None
+
+
+def emotion_duration_ms(emotion: str) -> int:
+    asset = emotion_asset(emotion)
+    if not asset:
+        return DEFAULT_EMOTION_DURATION_MS
+    return _duration_for_asset(asset)

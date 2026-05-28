@@ -219,7 +219,7 @@ void LumaQgifPlayer::renderFrame(uint8_t frame_index)
 
     const size_t pixel_count = static_cast<size_t>(_target_width) * _target_height;
     for (size_t i = 0; i < pixel_count; ++i) {
-        _framebuffer[i] = COLOR_WHITE;
+        _framebuffer[i] = COLOR_BLACK;
     }
 
     for (uint32_t y = 0; y < draw_h; ++y) {

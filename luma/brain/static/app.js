@@ -83,7 +83,7 @@ function renderEmotionPalette() {
     button.textContent = item.label || item.emotion;
     button.title = item.asset ? `${item.emotion} / ${item.asset}` : item.emotion;
     button.addEventListener("click", () => {
-      sendCommand({ type: "set_emotion", emotion: item.emotion, duration_ms: 3000 });
+      sendCommand({ type: "set_emotion", emotion: item.emotion });
     });
     els.emotionPalette.appendChild(button);
   });

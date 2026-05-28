@@ -1,7 +1,7 @@
 from pathlib import Path
 import unittest
 
-from luma.brain.emotions import EMOTION_PRESETS, GIF_DIR, qgif_path_for_emotion
+from luma.brain.emotions import EMOTION_PRESETS, GIF_DIR, emotion_duration_ms, qgif_path_for_emotion
 
 
 class EmotionCatalogTests(unittest.TestCase):
@@ -20,6 +20,11 @@ class EmotionCatalogTests(unittest.TestCase):
         self.assertEqual(qgif_path_for_emotion("discord").name, "Discord.qgif")
         self.assertEqual(action_eat["emotion"], "action_eat")
         self.assertEqual(qgif_path_for_emotion("action_eat").name, "action_eat.qgif")
+
+    def test_emotion_duration_comes_from_asset_frames(self):
+        self.assertEqual(emotion_duration_ms("happy"), 1620)
+        happy = next(item for item in EMOTION_PRESETS if item["emotion"] == "happy")
+        self.assertEqual(happy["duration_ms"], 1620)
 
 
 if __name__ == "__main__":

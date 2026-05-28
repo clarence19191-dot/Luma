@@ -1,6 +1,7 @@
 import unittest
 
 from luma.brain.commands import CommandValidationError, normalize_command, normalize_command_batch
+from luma.brain.emotions import emotion_duration_ms
 
 
 class CommandTests(unittest.TestCase):
@@ -35,6 +36,15 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(command["emotion"], "angry_fire")
         speak = normalize_command({"type": "speak", "text": "hello", "emotion": "uwu"})
         self.assertEqual(speak["emotion"], "uwu")
+
+    def test_set_emotion_defaults_to_timed_playback(self):
+        command = normalize_command({"type": "set_emotion", "emotion": "happy"})
+        self.assertEqual(command["duration_ms"], emotion_duration_ms("happy"))
+        self.assertNotEqual(command["duration_ms"], 3000)
+
+    def test_set_emotion_preserves_explicit_persistent_duration(self):
+        command = normalize_command({"type": "set_emotion", "emotion": "happy", "duration_ms": 0})
+        self.assertEqual(command["duration_ms"], 0)
 
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from .emotions import ALLOWED_EMOTIONS
+from .emotions import ALLOWED_EMOTIONS, emotion_duration_ms
 
 
 Tone = Literal["warm", "curious", "playful", "calm", "shy", "sleepy", "apologetic", "neutral"]
@@ -32,7 +32,18 @@ class ExpressionDecision(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     emotion: str = "idle"
-    duration_ms: int = Field(default=3000, ge=500, le=15000)
+    duration_ms: int = Field(default_factory=lambda: emotion_duration_ms("idle"), ge=0, le=15000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_duration_from_emotion(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or data.get("duration_ms") is not None:
+            return data
+        emotion = data.get("emotion", "idle")
+        if isinstance(emotion, str):
+            data = dict(data)
+            data["duration_ms"] = emotion_duration_ms(emotion.strip())
+        return data
 
     @field_validator("emotion")
     @classmethod
@@ -92,7 +103,7 @@ def fallback_decision(
     safe_emotion = emotion if emotion in ALLOWED_EMOTIONS else "dizzy"
     return LumaLLMDecision(
         reply=ReplyDecision(text=text, tone=tone),
-        expression=ExpressionDecision(emotion=safe_emotion, duration_ms=3000),
+        expression=ExpressionDecision(emotion=safe_emotion),
         pet_behavior=pet_behavior,
         actions=[],
         memory_candidates=[],

@@ -1,6 +1,7 @@
 import unittest
 
 from luma.brain.llm import fallback_decision, parse_llm_decision
+from luma.brain.emotions import emotion_duration_ms
 from luma.brain.prompt import LUMA_SYSTEM_PROMPT, build_luma_messages
 
 
@@ -40,6 +41,35 @@ class LLMContractTests(unittest.TestCase):
         self.assertEqual(decision.reply.text, "我在这儿。")
         self.assertEqual(decision.expression.emotion, "happy")
 
+    def test_missing_expression_duration_uses_asset_duration(self):
+        decision = parse_llm_decision(
+            """
+            {
+              "reply": {"text": "我在这儿。", "tone": "warm"},
+              "expression": {"emotion": "happy"},
+              "pet_behavior": "greet",
+              "actions": [],
+              "memory_candidates": [],
+              "safety": {"blocked": false, "reason": "", "needs_clarification": false}
+            }
+            """
+        )
+        self.assertEqual(decision.expression.duration_ms, emotion_duration_ms("happy"))
+
+        short_decision = parse_llm_decision(
+            """
+            {
+              "reply": {"text": "啪。", "tone": "playful"},
+              "expression": {"emotion": "pop_cat"},
+              "pet_behavior": "react",
+              "actions": [],
+              "memory_candidates": [],
+              "safety": {"blocked": false, "reason": "", "needs_clarification": false}
+            }
+            """
+        )
+        self.assertEqual(short_decision.expression.duration_ms, emotion_duration_ms("pop_cat"))
+
     def test_repairs_malformed_json_when_available(self):
         decision = parse_llm_decision(
             """
@@ -61,6 +91,7 @@ class LLMContractTests(unittest.TestCase):
     def test_invalid_decision_can_fallback(self):
         decision = parse_llm_decision("not json", fallback_on_error=True)
         self.assertEqual(decision.reply.text, fallback_decision().reply.text)
+        self.assertEqual(decision.expression.duration_ms, emotion_duration_ms(decision.expression.emotion))
         self.assertEqual(decision.memory_candidates, [])
 
 

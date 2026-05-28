@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .commands import CommandValidationError, command_duration_ms, normalize_command, normalize_command_batch
 from .config import settings
-from .emotions import EMOTION_PRESETS, qgif_path_for_emotion
+from .emotions import EMOTION_PRESETS, emotion_duration_ms, qgif_path_for_emotion
 from .memory import MemoryStore
 from .state import LumaState
 from .vision import VisionProvider
@@ -86,11 +86,17 @@ class HeadLink:
             return False
         outgoing = dict(message)
         if message.get("type") == "set_emotion" and isinstance(message.get("emotion"), str):
+            duration_ms = (
+                int(message.get("duration_ms"))
+                if message.get("duration_ms") is not None
+                else emotion_duration_ms(message["emotion"])
+            )
+            outgoing["duration_ms"] = duration_ms
             path = qgif_path_for_emotion(message["emotion"])
             if path is not None:
                 await self.send_qgif_for_emotion(
                     message["emotion"],
-                    duration_ms=int(message.get("duration_ms") or 0),
+                    duration_ms=duration_ms,
                 )
                 outgoing.setdefault("asset", path.name)
         await self.websocket.send_json(outgoing)
@@ -348,9 +354,20 @@ class LumaRuntime:
                     self.state.mark_disconnected()
                     self.memory.log("head_timeout", {"timeout_seconds": settings.head_timeout_seconds})
                     changed.append("head_timeout")
+            await self._sync_head_on_state_changes(changed)
             if changed:
                 await self.broadcast_state(",".join(changed))
             await self._maybe_send_idle_expression()
+
+    async def _sync_head_on_state_changes(self, changed: list[str]) -> None:
+        if "emotion_timeout" not in changed:
+            return
+        try:
+            await self.head.send_json({"type": "set_emotion", "emotion": "idle"})
+        except Exception as exc:
+            self.memory.log("emotion_timeout_sync_error", {"error": str(exc)})
+            self.state.mark_disconnected()
+            changed.append("emotion_timeout_sync_error")
 
     async def _maybe_send_idle_expression(self) -> None:
         if not settings.idle_expression_enabled:

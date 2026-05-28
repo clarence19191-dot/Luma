@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from .emotions import ALLOWED_EMOTIONS as CATALOG_EMOTIONS
+from .emotions import emotion_duration_ms
 
 ALLOWED_EMOTIONS = set(CATALOG_EMOTIONS) | {"curious", "error"}
 
@@ -51,8 +52,11 @@ def normalize_command(raw: dict[str, Any], *, command_id: str | None = None) -> 
         if emotion not in ALLOWED_EMOTIONS:
             raise CommandValidationError("invalid_emotion", f"Unsupported emotion: {emotion!r}.")
         duration_ms = command.get("duration_ms")
-        if duration_ms is not None:
-            command["duration_ms"] = _int_in_range(duration_ms, 0, 60_000, "duration_ms")
+        command["duration_ms"] = (
+            emotion_duration_ms(emotion)
+            if duration_ms is None
+            else _int_in_range(duration_ms, 0, 60_000, "duration_ms")
+        )
 
     elif command_type == "move_head":
         mode = command.get("mode", "absolute")
